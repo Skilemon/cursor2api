@@ -6,10 +6,16 @@
  */
 
 import 'dotenv/config';
+import { createRequire } from 'module';
 import express from 'express';
 import { getConfig } from './config.js';
 import { handleMessages, listModels, countTokens } from './handler.js';
-import { handleOpenAIChatCompletions } from './openai-handler.js';
+import { handleOpenAIChatCompletions, handleOpenAIResponses } from './openai-handler.js';
+
+// 从 package.json 读取版本号，统一来源，避免多处硬编码
+const require = createRequire(import.meta.url);
+const { version: VERSION } = require('../package.json') as { version: string };
+
 
 const app = express();
 const config = getConfig();
@@ -39,6 +45,10 @@ app.post('/messages', handleMessages);
 app.post('/v1/chat/completions', handleOpenAIChatCompletions);
 app.post('/chat/completions', handleOpenAIChatCompletions);
 
+// OpenAI Responses API（Cursor IDE Agent 模式）
+app.post('/v1/responses', handleOpenAIResponses);
+app.post('/responses', handleOpenAIResponses);
+
 // Token 计数
 app.post('/v1/messages/count_tokens', countTokens);
 app.post('/messages/count_tokens', countTokens);
@@ -48,24 +58,26 @@ app.get('/v1/models', listModels);
 
 // 健康检查
 app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', version: '2.3.2', uptime: process.uptime() });
+    res.json({ status: 'ok', version: VERSION });
 });
 
 // 根路径
 app.get('/', (_req, res) => {
     res.json({
         name: 'cursor2api',
-        version: '2.3.2',
-        description: 'Cursor Docs AI → Anthropic & OpenAI API Proxy',
+        version: VERSION,
+        description: 'Cursor Docs AI → Anthropic & OpenAI & Cursor IDE API Proxy',
         endpoints: {
             anthropic_messages: 'POST /v1/messages',
             openai_chat: 'POST /v1/chat/completions',
+            openai_responses: 'POST /v1/responses',
             models: 'GET /v1/models',
             health: 'GET /health',
         },
         usage: {
             claude_code: 'export ANTHROPIC_BASE_URL=http://localhost:' + config.port,
             openai_compatible: 'OPENAI_BASE_URL=http://localhost:' + config.port + '/v1',
+            cursor_ide: 'OPENAI_BASE_URL=http://localhost:' + config.port + '/v1 (选用 Claude 模型)',
         },
     });
 });
@@ -75,7 +87,7 @@ app.get('/', (_req, res) => {
 app.listen(config.port, () => {
     console.log('');
     console.log('  ╔══════════════════════════════════════╗');
-    console.log('  ║        Cursor2API v2.3.2             ║');
+    console.log(`  ║        Cursor2API v${VERSION.padEnd(21)}║`);
     console.log('  ╠══════════════════════════════════════╣');
     console.log(`  ║  Server:  http://localhost:${config.port}      ║`);
     console.log('  ║  Model:   ' + config.cursorModel.padEnd(26) + '║');
@@ -83,11 +95,12 @@ app.listen(config.port, () => {
     console.log('  ║  API Endpoints:                      ║');
     console.log('  ║  • Anthropic: /v1/messages            ║');
     console.log('  ║  • OpenAI:   /v1/chat/completions     ║');
+    console.log('  ║  • Cursor:   /v1/responses            ║');
     console.log('  ╠══════════════════════════════════════╣');
     console.log('  ║  Claude Code:                        ║');
     console.log(`  ║  export ANTHROPIC_BASE_URL=           ║`);
     console.log(`  ║    http://localhost:${config.port}              ║`);
-    console.log('  ║  OpenAI 兼容:                        ║');
+    console.log('  ║  OpenAI / Cursor IDE:                 ║');
     console.log(`  ║  OPENAI_BASE_URL=                     ║`);
     console.log(`  ║    http://localhost:${config.port}/v1            ║`);
     console.log('  ╚══════════════════════════════════════╝');
