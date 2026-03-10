@@ -11,6 +11,7 @@ import type {
     AnthropicRequest,
     AnthropicResponse,
     AnthropicContentBlock,
+    AnthropicMessage,
     CursorChatRequest,
     CursorSSEEvent,
 } from './types.js';
@@ -363,7 +364,14 @@ async function handleMockIdentityNonStream(res: Response, body: AnthropicRequest
 export async function handleMessages(req: Request, res: Response): Promise<void> {
     const body = req.body as AnthropicRequest;
 
+    const lastUserMsg = body.messages?.slice().reverse().find((m: AnthropicMessage) => m.role === 'user');
+    const lastUserText = typeof lastUserMsg?.content === 'string'
+        ? lastUserMsg.content
+        : Array.isArray(lastUserMsg?.content)
+            ? (lastUserMsg.content as AnthropicContentBlock[]).filter(b => b.type === 'text').map(b => b.text).join(' ')
+            : '';
     console.log(`[Handler] 收到请求: model=${body.model}, messages=${body.messages?.length}, stream=${body.stream}, tools=${body.tools?.length ?? 0}`);
+    console.log(`[Handler] 最后用户消息: ${lastUserText.substring(0, 200)}${lastUserText.length > 200 ? '...' : ''}`);
 
     try {
         // 注意：图片预处理已移入 convertToCursorRequest → preprocessImages() 统一处理
@@ -456,7 +464,6 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
     });
 
     let fullResponse = '';
-    let sentText = '';
     let blockIndex = 0;
     let textBlockStarted = false;
 
@@ -477,6 +484,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
 
     try {
         await executeStream();
+        console.log(`[Handler] 原始响应 (${fullResponse.length} chars): ${fullResponse.substring(0, 300)}${fullResponse.length > 300 ? '...' : ''}`);
 
         // 无工具模式：检测拒绝并自动重试
         if (!hasTools) {
@@ -499,11 +507,31 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
             }
         }
 
+        // 有工具模式：检测截断并自动重试
+        const MAX_TRUNCATION_RETRIES = 2;
+        if (hasTools) {
+            let truncationRetry = 0;
+            while (truncationRetry < MAX_TRUNCATION_RETRIES) {
+                const { toolCalls: tc } = parseToolCalls(fullResponse);
+                // 截断判断：有 ```json action 开头的块，但没有有效工具调用
+                // 说明响应里的 json action 块全部被截断了
+                const hasActionMarker = /```json\s+action/i.test(fullResponse);
+                const looksLikeTruncation = tc.length === 0 && hasActionMarker;
+                if (!looksLikeTruncation) break;
+                truncationRetry++;
+                console.log(`[Handler] 检测到截断响应（${fullResponse.length} chars，有action块但无有效工具调用），第${truncationRetry}次重试...`);
+                await executeStream();
+                console.log(`[Handler] 重试后响应 (${fullResponse.length} chars): ${fullResponse.substring(0, 200)}`);
+            }
+        }
+
         // 流完成后，处理完整响应
         let stopReason = 'end_turn';
 
         if (hasTools) {
             let { toolCalls, cleanText } = parseToolCalls(fullResponse);
+            console.log(`[Handler] 工具解析结果: ${toolCalls.length} 个工具调用, cleanText长度=${cleanText.length}`);
+            if (toolCalls.length > 0) console.log(`[Handler] 工具列表: ${toolCalls.map(t => t.name).join(', ')}`);
 
             if (toolCalls.length > 0) {
                 stopReason = 'tool_use';
@@ -515,7 +543,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
                 }
 
                 // Any clean text is sent as a single block before the tool blocks
-                const unsentCleanText = cleanText.substring(sentText.length).trim();
+                const unsentCleanText = cleanText.trim();
 
                 if (unsentCleanText) {
                     if (!textBlockStarted) {
@@ -527,7 +555,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
                     }
                     writeSSE(res, 'content_block_delta', {
                         type: 'content_block_delta', index: blockIndex,
-                        delta: { type: 'text_delta', text: (sentText && !sentText.endsWith('\n') ? '\n' : '') + unsentCleanText }
+                        delta: { type: 'text_delta', text: unsentCleanText }
                     });
                 }
 
@@ -569,7 +597,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
                     textToSend = 'I understand the request. Let me proceed with the appropriate action. Could you clarify what specific task you would like me to perform?';
                 }
 
-                const unsentText = textToSend.substring(sentText.length);
+                const unsentText = textToSend;
                 if (unsentText) {
                     if (!textBlockStarted) {
                         writeSSE(res, 'content_block_start', {

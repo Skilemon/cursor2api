@@ -48,7 +48,7 @@ app.get('/v1/models', listModels);
 
 // 健康检查
 app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', version: '2.3.2' });
+    res.json({ status: 'ok', version: '2.3.2', uptime: process.uptime() });
 });
 
 // 根路径

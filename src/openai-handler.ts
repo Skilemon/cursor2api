@@ -72,6 +72,7 @@ function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
                 // 助手消息可能包含 tool_calls
                 const blocks: AnthropicContentBlock[] = [];
                 const contentBlocks = extractOpenAIContentBlocks(msg);
+
                 if (typeof contentBlocks === 'string' && contentBlocks) {
                     blocks.push({ type: 'text', text: contentBlocks });
                 } else if (Array.isArray(contentBlocks)) {
@@ -97,7 +98,7 @@ function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
 
                 messages.push({
                     role: 'assistant',
-                    content: blocks.length > 0 ? blocks : (typeof extractOpenAIContentBlocks(msg) === 'string' ? extractOpenAIContentBlocks(msg) as string : ''),
+                    content: blocks.length > 0 ? blocks : '',
                 });
                 break;
             }
@@ -187,7 +188,14 @@ function extractOpenAIContent(msg: OpenAIMessage): string {
 export async function handleOpenAIChatCompletions(req: Request, res: Response): Promise<void> {
     const body = req.body as OpenAIChatRequest;
 
+    const lastUserMsg = body.messages?.slice().reverse().find((m: OpenAIMessage) => m.role === 'user');
+    const lastUserText = typeof lastUserMsg?.content === 'string'
+        ? lastUserMsg.content
+        : Array.isArray(lastUserMsg?.content)
+            ? lastUserMsg.content.filter((b: {type: string; text?: string}) => b.type === 'text').map((b: {type: string; text?: string}) => b.text).join(' ')
+            : '';
     console.log(`[OpenAI] 收到请求: model=${body.model}, messages=${body.messages?.length}, stream=${body.stream}, tools=${body.tools?.length ?? 0}`);
+    console.log(`[OpenAI] 最后用户消息: ${lastUserText.substring(0, 200)}${lastUserText.length > 200 ? '...' : ''}`);
 
     try {
         // Step 1: OpenAI → Anthropic 格式
@@ -296,7 +304,6 @@ async function handleOpenAIStream(
     });
 
     let fullResponse = '';
-    let sentText = '';
     let activeCursorReq = cursorReq;
     let retryCount = 0;
 
@@ -311,6 +318,7 @@ async function handleOpenAIStream(
 
     try {
         await executeStream();
+        console.log(`[OpenAI] 原始响应 (${fullResponse.length} chars): ${fullResponse.substring(0, 300)}${fullResponse.length > 300 ? '...' : ''}`);
 
         // 无工具模式：检测拒绝并自动重试
         if (!hasTools) {
@@ -334,8 +342,10 @@ async function handleOpenAIStream(
 
         let finishReason: 'stop' | 'tool_calls' = 'stop';
 
-        if (hasTools && hasToolCalls(fullResponse)) {
+        if (hasTools) {
             const { toolCalls, cleanText } = parseToolCalls(fullResponse);
+            console.log(`[OpenAI] 工具解析结果: ${toolCalls.length} 个工具调用, cleanText长度=${cleanText.length}`);
+            if (toolCalls.length > 0) console.log(`[OpenAI] 工具列表: ${toolCalls.map(t => t.name).join(', ')}`);
 
             if (toolCalls.length > 0) {
                 finishReason = 'tool_calls';
@@ -539,14 +549,3 @@ function writeOpenAISSE(res: Response, data: OpenAIChatCompletionChunk): void {
     if (typeof res.flush === 'function') res.flush();
 }
 
-/**
- * 找到 cleanText 中已经发送过的文本长度
- */
-function findMatchLength(cleanText: string, sentText: string): number {
-    for (let i = Math.min(cleanText.length, sentText.length); i >= 0; i--) {
-        if (cleanText.startsWith(sentText.substring(0, i))) {
-            return i;
-        }
-    }
-    return 0;
-}

@@ -31,7 +31,7 @@ export function getConfig(): AppConfig {
             }
             if (yaml.vision) {
                 config.vision = {
-                    enabled: yaml.vision.enabled !== false, // default to true if vision section exists in some way
+                    enabled: yaml.vision.enabled === true, // only enable if explicitly set to true
                     mode: yaml.vision.mode || 'ocr',
                     baseUrl: yaml.vision.base_url || 'https://api.openai.com/v1/chat/completions',
                     apiKey: yaml.vision.api_key || '',

@@ -41,6 +41,23 @@ function buildToolInstructions(tools: AnthropicTool[], hasCommunicationTool: boo
         ? `When performing actions, always include the structured block. For independent actions, include multiple blocks. For dependent actions (where one result feeds into the next), wait for each result. When you have nothing to execute or need to ask the user something, use the communication actions (attempt_completion, ask_followup_question). Do not run empty or meaningless commands.`
         : `Include the structured block when performing actions. For independent actions, include multiple blocks. For dependent actions, wait for each result. Keep explanatory text brief. If you have completed the task or have nothing to execute, respond in plain text without any structured block. Do not run meaningless commands like "echo ready".`;
 
+    const fileModificationRules = `
+## File Modification Rules (CRITICAL - API output limit applies)
+- Write tool: single call MUST be < 150 lines. If content exceeds 150 lines, you MUST split it.
+- Edit tool: single call MUST be < 50 lines of changes.
+- NEVER attempt to Write or Edit more than these limits in one call — it will be truncated and cause errors.
+- If a Write/Edit fails, do NOT retry the same large content. Break it into smaller chunks instead.
+
+## How to write large files (> 150 lines):
+Strategy A - Skeleton + Fill (for code files):
+  1. Write a skeleton with imports + empty stubs (< 150 lines)
+  2. Use multiple Edit calls to fill in each stub (< 50 lines each)
+Strategy B - Sequential append (for any file type, e.g. Markdown, config):
+  1. Write first chunk (< 150 lines) to create the file
+  2. Use Edit to append next chunk: set old_string to the LAST 2-3 lines of current file, set new_string to those same lines PLUS the next chunk (< 50 lines)
+  3. Repeat step 2 until all content is written
+  IMPORTANT: In step 2, old_string must exactly match the current file ending so Edit can locate it.`;
+
     return `You are operating within an IDE environment with access to the following actions. To invoke an action, include it in your response using this structured format:
 
 \`\`\`json action
@@ -55,7 +72,7 @@ function buildToolInstructions(tools: AnthropicTool[], hasCommunicationTool: boo
 Available actions:
 ${toolList}
 
-${behaviorRules}`;
+${behaviorRules}${fileModificationRules}`;
 }
 
 // ==================== 请求转换 ====================
@@ -305,38 +322,123 @@ function extractToolResultText(block: AnthropicContentBlock): string {
 
 // ==================== 响应解析 ====================
 
+/**
+ * 从指定位置开始，使用平衡括号算法找到完整 JSON 对象的结束位置
+ */
+function findBalancedJsonEnd(text: string, startPos: number): number {
+    const openChar = text[startPos];
+    if (openChar !== '{' && openChar !== '[') return -1;
+    const closeChar = openChar === '{' ? '}' : ']';
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let i = startPos; i < text.length; i++) {
+        const ch = text[i];
+
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+
+        if (ch === '\\' && inString) {
+            escaped = true;
+            continue;
+        }
+
+        if (ch === '"') {
+            inString = !inString;
+            continue;
+        }
+
+        if (inString) continue;
+
+        if (ch === openChar) {
+            depth++;
+        } else if (ch === closeChar) {
+            depth--;
+            if (depth === 0) {
+                return i;
+            }
+        }
+    }
+
+    return -1; // unclosed
+}
+
 function tolerantParse(jsonStr: string): any {
     try {
         return JSON.parse(jsonStr);
     } catch (e) {
-        let inString = false;
-        let escaped = false;
-        let fixed = '';
-        for (let i = 0; i < jsonStr.length; i++) {
-            const char = jsonStr[i];
-            if (char === '\\' && !escaped) {
-                escaped = true;
-                fixed += char;
-            } else if (char === '"' && !escaped) {
-                inString = !inString;
-                fixed += char;
-                escaped = false;
-            } else {
-                if (inString && (char === '\n' || char === '\r')) {
-                    fixed += char === '\n' ? '\\n' : '\\r';
-                } else if (inString && char === '\t') {
-                    fixed += '\\t';
-                } else {
+        // Strategy 1: fix unescaped control characters and trailing commas
+        try {
+            let inString = false;
+            let escaped = false;
+            let fixed = '';
+            for (let i = 0; i < jsonStr.length; i++) {
+                const char = jsonStr[i];
+                if (char === '\\' && !escaped) {
+                    escaped = true;
                     fixed += char;
+                } else if (char === '"' && !escaped) {
+                    inString = !inString;
+                    fixed += char;
+                    escaped = false;
+                } else {
+                    if (inString && (char === '\n' || char === '\r')) {
+                        fixed += char === '\n' ? '\\n' : '\\r';
+                    } else if (inString && char === '\t') {
+                        fixed += '\\t';
+                    } else if (inString && char.charCodeAt(0) < 0x20) {
+                        // escape other control characters
+                        fixed += '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0');
+                    } else {
+                        fixed += char;
+                    }
+                    escaped = false;
                 }
-                escaped = false;
             }
+            // Remove trailing commas
+            fixed = fixed.replace(/,\s*([}\]])/g, '$1');
+            return JSON.parse(fixed);
+        } catch (_e2) {
+            // Strategy 2: extract just the tool/name fields with regex as fallback
+            const toolMatch = jsonStr.match(/"tool"\s*:\s*"([^"]+)"/);
+            const nameMatch = jsonStr.match(/"name"\s*:\s*"([^"]+)"/);
+            const toolName = toolMatch?.[1] || nameMatch?.[1];
+            if (!toolName) throw e;
+
+            // Try to extract parameters block
+            let params: Record<string, unknown> = {};
+            const paramsMatch = jsonStr.match(/"parameters"\s*:\s*(\{[\s\S]*\})|"arguments"\s*:\s*(\{[\s\S]*\})|"input"\s*:\s*(\{[\s\S]*\})/);
+            if (paramsMatch) {
+                const paramsStr = paramsMatch[1] || paramsMatch[2] || paramsMatch[3];
+                try {
+                    params = JSON.parse(paramsStr);
+                } catch {
+                    // truncate to last valid JSON by finding balanced braces
+                    let depth = 0;
+                    let end = 0;
+                    let inStr = false;
+                    let esc = false;
+                    for (let i = 0; i < paramsStr.length; i++) {
+                        const c = paramsStr[i];
+                        if (c === '\\' && !esc) { esc = true; continue; }
+                        if (c === '"' && !esc) { inStr = !inStr; }
+                        if (!inStr) {
+                            if (c === '{') { depth++; end = i; }
+                            else if (c === '}') { depth--; end = i; if (depth === 0) break; }
+                        }
+                        esc = false;
+                    }
+                    try {
+                        params = JSON.parse(paramsStr.substring(0, end + 1));
+                    } catch { /* use empty params */ }
+                }
+            }
+            return { tool: toolName, parameters: params };
         }
-
-        // Remove trailing commas
-        fixed = fixed.replace(/,\s*([}\]])/g, '$1');
-
-        return JSON.parse(fixed);
     }
 }
 
@@ -347,32 +449,110 @@ export function parseToolCalls(responseText: string): {
     const toolCalls: ParsedToolCall[] = [];
     let cleanText = responseText;
 
-    const fullBlockRegex = /```json(?:\s+action)?\s*([\s\S]*?)\s*```/g;
+    console.log(`[Converter] parseToolCalls 输入长度: ${responseText.length} chars`);
 
+    // Find ```json action markers
+    const markerRe = /```json\s+action/g;
     let match: RegExpExecArray | null;
-    while ((match = fullBlockRegex.exec(responseText)) !== null) {
+    let blockCount = 0;
+
+    while ((match = markerRe.exec(responseText)) !== null) {
+        blockCount++;
+        const markerEnd = match.index + match[0].length;
+
+        // Skip whitespace after marker
+        let jsonStart = markerEnd;
+        while (jsonStart < responseText.length && /[\s\n\r\t]/.test(responseText[jsonStart])) {
+            jsonStart++;
+        }
+
+        // Find JSON end using balanced brackets
+        let jsonEnd = findBalancedJsonEnd(responseText, jsonStart);
+
+        // If JSON is incomplete (truncated response), try partial recovery for Write tool
+        if (jsonEnd === -1) {
+            const remainingText = responseText.slice(jsonStart);
+            const closingMarkerIdx = remainingText.indexOf('\n```');
+            const blockEndIdx = closingMarkerIdx !== -1 ? closingMarkerIdx : remainingText.length;
+            const incompleteJson = remainingText.slice(0, blockEndIdx);
+
+            const toolMatch = incompleteJson.match(/"tool"\s*:\s*"([^"]+)"/);
+            const toolName = toolMatch ? toolMatch[1] : 'unknown';
+
+            // For Write tool: extract file_path and whatever content we have so far
+            // This avoids infinite retry loops when writing large files
+            if (toolName === 'Write' || toolName === 'write') {
+                const filePathMatch = incompleteJson.match(/"file_path"\s*:\s*"([^"]+)"/);
+                // Extract content up to where it was cut off (remove trailing escape sequences)
+                const contentStart = incompleteJson.indexOf('"content"\s*:'.replace('\\s*', ' '));
+                const contentMatch = incompleteJson.match(/"content"\s*:\s*"([\s\S]*)/);
+                if (filePathMatch && contentMatch) {
+                    // Clean up truncated content: unescape and trim
+                    let truncatedContent = contentMatch[1]
+                        .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\r/g, '')
+                        .replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+                    // Remove trailing incomplete escape sequence
+                    truncatedContent = truncatedContent.replace(/\\[^\\ntr"]?$/, '');
+                    console.log(`[Converter] 块 ${blockCount}: Write 工具被截断，提取部分内容写入 "${filePathMatch[1]}" (${truncatedContent.length} chars)`);
+                    toolCalls.push({
+                        name: toolName,
+                        arguments: { file_path: filePathMatch[1], content: truncatedContent }
+                    });
+                } else {
+                    console.log(`[Converter] 块 ${blockCount}: Write 工具被截断但无法提取参数，丢弃`);
+                }
+            } else {
+                console.log(`[Converter] 块 ${blockCount}: JSON 被截断（工具=${toolName}），丢弃此块`);
+            }
+
+            // Remove the incomplete block from cleanText
+            const fullBlock = responseText.slice(match.index, jsonStart + blockEndIdx);
+            cleanText = cleanText.split(fullBlock).join('');
+            continue;
+        }
+
+        // Find closing ```
+        let afterJson = jsonEnd + 1;
+        while (afterJson < responseText.length && /[\s\n\r\t]/.test(responseText[afterJson])) {
+            afterJson++;
+        }
+        const hasClosingMarker = responseText.startsWith('```', afterJson);
+        console.log(`[Converter] 块 ${blockCount}: JSON 范围 [${jsonStart}, ${jsonEnd}], 闭合标记=${hasClosingMarker}`);
+
+        // Allow unclosed blocks: if JSON is complete but ``` is missing (truncated response),
+        // still parse the tool call rather than silently dropping it
+        const blockEnd = hasClosingMarker ? afterJson + 3 : jsonEnd + 1;
+        const fullBlock = responseText.slice(match.index, blockEnd);
+        const jsonContent = responseText.slice(jsonStart, jsonEnd + 1);
+
         let isToolCall = false;
         try {
-            const parsed = tolerantParse(match[1]);
-            // check for tool or name
+            const parsed = tolerantParse(jsonContent);
             if (parsed.tool || parsed.name) {
+                const toolName = parsed.tool || parsed.name;
+                const toolArgs = parsed.parameters || parsed.arguments || parsed.input || {};
+                console.log(`[Converter] 块 ${blockCount}: 成功解析工具 "${toolName}", 参数键: ${Object.keys(toolArgs).join(', ')}`);
                 toolCalls.push({
-                    name: parsed.tool || parsed.name,
-                    arguments: parsed.parameters || parsed.arguments || parsed.input || {}
+                    name: toolName,
+                    arguments: toolArgs
                 });
                 isToolCall = true;
+            } else {
+                console.log(`[Converter] 块 ${blockCount}: JSON 缺少 tool/name 字段，跳过`);
             }
         } catch (e) {
-            // Ignored, not a valid json tool call
-            console.error('[Converter] tolerantParse 失败:', e);
+            const errorMsg = e instanceof Error ? e.message : String(e);
+            const preview = jsonContent.substring(0, 50).replace(/\n/g, ' ');
+            console.log(`[Converter] 块 ${blockCount}: 跳过无效 JSON: ${preview}... (${errorMsg})`);
         }
 
         if (isToolCall) {
-            // 移除已解析的调用块
-            cleanText = cleanText.replace(match[0], '');
+            // split/join 确保删除所有相同块（防止重复工具调用残留）
+            cleanText = cleanText.split(fullBlock).join('');
         }
     }
 
+    console.log(`[Converter] parseToolCalls 结果: ${toolCalls.length} 个工具调用, cleanText长度=${cleanText.trim().length}`);
     return { toolCalls, cleanText: cleanText.trim() };
 }
 
@@ -380,7 +560,7 @@ export function parseToolCalls(responseText: string): {
  * 检查文本是否包含工具调用
  */
 export function hasToolCalls(text: string): boolean {
-    return text.includes('```json');
+    return /```json\s+action[\s\S]*?"tool"\s*:/.test(text);
 }
 
 /**
