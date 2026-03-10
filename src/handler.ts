@@ -135,18 +135,32 @@ export function listModels(_req: Request, res: Response): void {
 
 // ==================== Token 计数 ====================
 
-export function countTokens(req: Request, res: Response): void {
-    const body = req.body as AnthropicRequest;
+export function estimateInputTokens(body: AnthropicRequest): number {
     let totalChars = 0;
 
     if (body.system) {
         totalChars += typeof body.system === 'string' ? body.system.length : JSON.stringify(body.system).length;
     }
+    
     for (const msg of body.messages ?? []) {
         totalChars += typeof msg.content === 'string' ? msg.content.length : JSON.stringify(msg.content).length;
     }
 
-    res.json({ input_tokens: Math.max(1, Math.ceil(totalChars / 4)) });
+    // Tool schemas are heavily compressed by compactSchema in converter.ts.
+    // However, they still consume Cursor's context budget. 
+    // If not counted, Claude CLI will dangerously underestimate context size.
+    if (body.tools && body.tools.length > 0) {
+        totalChars += body.tools.length * 200; // ~200 chars per compressed tool signature
+        totalChars += 1000; // Tool use guidelines and behavior instructions
+    }
+    
+    // Safer estimation for mixed Chinese/English and Code: 1 token ≈ 3 chars + 10% safety margin.
+    return Math.max(1, Math.ceil((totalChars / 3) * 1.1));
+}
+
+export function countTokens(req: Request, res: Response): void {
+    const body = req.body as AnthropicRequest;
+    res.json({ input_tokens: estimateInputTokens(body) });
 }
 
 // ==================== 身份探针拦截 ====================
@@ -413,15 +427,94 @@ export function isTruncated(text: string): boolean {
     // 代码块未闭合
     const codeBlockOpen = (trimmed.match(/```/g) || []).length % 2 !== 0;
     if (codeBlockOpen) return true;
+    // 检测 ```json action 块已开始但 JSON 对象未闭合（截断发生在工具调用参数中间）
+    const jsonActionBlocks = trimmed.match(/```json\s+action[\s\S]*?```/g) || [];
+    const jsonActionOpens = (trimmed.match(/```json\s+action/g) || []).length;
+    if (jsonActionOpens > jsonActionBlocks.length) return true;
     // XML/HTML 标签未闭合 (Cursor 有时在中途截断)
     const openTags = (trimmed.match(/^<[a-zA-Z]/gm) || []).length;
     const closeTags = (trimmed.match(/^<\/[a-zA-Z]/gm) || []).length;
     if (openTags > closeTags + 1) return true;
     // 以逗号、分号、冒号、开括号结尾（明显未完成）
     if (/[,;:\[{(]\s*$/.test(trimmed)) return true;
+    // 长响应以反斜杠 + n 结尾（JSON 字符串中间被截断）
+    if (trimmed.length > 2000 && /\\n?\s*$/.test(trimmed) && !trimmed.endsWith('```')) return true;
     // 短响应且以小写字母结尾（句子被截断的强烈信号）
     if (trimmed.length < 500 && /[a-z]$/.test(trimmed)) return false; // 短响应不判断
     return false;
+}
+
+// ==================== 续写去重 ====================
+
+/**
+ * 续写拼接智能去重
+ * 
+ * 模型续写时经常重复截断点附近的内容，导致拼接后出现重复段落。
+ * 此函数在 existing 的尾部和 continuation 的头部之间寻找最长重叠，
+ * 然后返回去除重叠部分的 continuation。
+ * 
+ * 算法：从续写内容的头部取不同长度的前缀，检查是否出现在原内容的尾部
+ */
+function deduplicateContinuation(existing: string, continuation: string): string {
+    if (!continuation || !existing) return continuation;
+
+    // 对比窗口：取原内容尾部和续写头部的最大重叠检测范围
+    const maxOverlap = Math.min(500, existing.length, continuation.length);
+    if (maxOverlap < 10) return continuation; // 太短不值得去重
+
+    const tail = existing.slice(-maxOverlap);
+
+    // 从长到短搜索重叠：找最长的匹配
+    let bestOverlap = 0;
+    for (let len = maxOverlap; len >= 10; len--) {
+        const prefix = continuation.substring(0, len);
+        // 检查 prefix 是否出现在 tail 的末尾
+        if (tail.endsWith(prefix)) {
+            bestOverlap = len;
+            break;
+        }
+    }
+
+    // 如果没找到尾部完全匹配的重叠，尝试行级别的去重
+    // 场景：模型从某一行的开头重新开始，但截断点可能在行中间
+    if (bestOverlap === 0) {
+        const continuationLines = continuation.split('\n');
+        const tailLines = tail.split('\n');
+        
+        // 从续写的第一行开始，在原内容尾部的行中寻找匹配
+        if (continuationLines.length > 0 && tailLines.length > 0) {
+            const firstContLine = continuationLines[0].trim();
+            if (firstContLine.length >= 10) {
+                // 检查续写的前几行是否在原内容尾部出现过
+                for (let i = tailLines.length - 1; i >= 0; i--) {
+                    if (tailLines[i].trim() === firstContLine) {
+                        // 从这一行开始往后对比连续匹配的行数
+                        let matchedLines = 1;
+                        for (let k = 1; k < continuationLines.length && i + k < tailLines.length; k++) {
+                            if (continuationLines[k].trim() === tailLines[i + k].trim()) {
+                                matchedLines++;
+                            } else {
+                                break;
+                            }
+                        }
+                        if (matchedLines >= 2) {
+                            // 移除续写中匹配的行
+                            const deduped = continuationLines.slice(matchedLines).join('\n');
+                            console.log(`[Handler] 行级去重: 移除了续写前 ${matchedLines} 行的重复内容`);
+                            return deduped;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (bestOverlap > 0) {
+        return continuation.substring(bestOverlap);
+    }
+
+    return continuation;
 }
 
 // ==================== 重试辅助 ====================
@@ -481,7 +574,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         message: {
             id, type: 'message', role: 'assistant', content: [],
             model, stop_reason: null, stop_sequence: null,
-            usage: { input_tokens: 100, output_tokens: 0 },
+            usage: { input_tokens: estimateInputTokens(body), output_tokens: 0 },
         },
     });
 
@@ -554,11 +647,81 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         }
 
         // 流完成后，处理完整响应
-        // ★ 截断检测：代码块/XML 未闭合时，返回 max_tokens 让 Claude Code 自动继续
-        // 避免用户每次都要手动点击"继续"
+        // ★ 内部截断续写：如果模型输出过长被截断（常见于写大文件），Proxy 内部分段续写，然后拼接成完整响应
+        // 这样可以确保工具调用（如 Write）不会横跨两次 API 响应而退化为纯文本
+        const MAX_AUTO_CONTINUE = 6;
+        let continueCount = 0;
+        
+        // 保存原始请求的消息快照（不含续写追加的消息）
+        const originalMessages = [...activeCursorReq.messages];
+        
+        while (hasTools && isTruncated(fullResponse) && continueCount < MAX_AUTO_CONTINUE) {
+            continueCount++;
+            const prevLength = fullResponse.length;
+            console.log(`[Handler] ⚠️ 内部检测到截断 (${fullResponse.length} chars)，Proxy 将隐式请求无缝续写 (第${continueCount}次)...`);
+            
+            // 提取截断点的最后一段文本作为上下文锚点
+            const anchorLength = Math.min(300, fullResponse.length);
+            const anchorText = fullResponse.slice(-anchorLength);
+            
+            // 构造续写请求：原始消息 + 截断的 assistant 回复 + user 续写引导
+            // 每次重建而非累积，防止上下文膨胀
+            const continuationPrompt = `Your previous response was cut off mid-output. The last part of your output was:
+
+\`\`\`
+...${anchorText}
+\`\`\`
+
+Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
+
+            activeCursorReq = {
+                ...activeCursorReq,
+                messages: [
+                    ...originalMessages,
+                    {
+                        parts: [{ type: 'text', text: fullResponse }],
+                        id: uuidv4(),
+                        role: 'assistant',
+                    },
+                    {
+                        parts: [{ type: 'text', text: continuationPrompt }],
+                        id: uuidv4(),
+                        role: 'user',
+                    },
+                ],
+            };
+            
+            let continuationResponse = '';
+            await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
+                if (event.type === 'text-delta' && event.delta) {
+                    continuationResponse += event.delta;
+                }
+            });
+
+            if (continuationResponse.trim().length === 0) {
+                console.log(`[Handler] ⚠️ 续写返回空响应，停止续写`);
+                break;
+            }
+
+            // ★ 智能去重：模型续写时经常重复截断点前的内容
+            // 在 fullResponse 末尾和 continuationResponse 开头之间寻找重叠部分并移除
+            const deduped = deduplicateContinuation(fullResponse, continuationResponse);
+            fullResponse += deduped;
+            if (deduped.length !== continuationResponse.length) {
+                console.log(`[Handler] 续写去重: 移除了 ${continuationResponse.length - deduped.length} chars 的重复内容`);
+            }
+            console.log(`[Handler] 续写拼接完成: ${prevLength} → ${fullResponse.length} chars (+${deduped.length})`);
+
+            // ★ 无进展检测：去重后没有新内容，说明模型在重复自己，继续续写无意义
+            if (deduped.trim().length === 0) {
+                console.log(`[Handler] ⚠️ 续写内容全部为重复，停止续写`);
+                break;
+            }
+        }
+
         let stopReason = (hasTools && isTruncated(fullResponse)) ? 'max_tokens' : 'end_turn';
         if (stopReason === 'max_tokens') {
-            console.log(`[Handler] ⚠️ 检测到截断响应 (${fullResponse.length} chars)，设置 stop_reason=max_tokens`);
+            console.log(`[Handler] ⚠️ ${MAX_AUTO_CONTINUE}次隐式续写后仍受限于截断 (${fullResponse.length} chars)，设置 stop_reason=max_tokens`);
         }
 
         if (hasTools) {
@@ -664,7 +827,14 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
                 // We must send the remaining unsent fullResponse.
                 let textToSend = fullResponse;
 
-                if (isRefusal(fullResponse)) {
+                // ★ 仅对短响应或开头明确匹配拒绝模式的响应进行压制
+                // 长响应（如模型在写报告）中可能碰巧包含某个宽泛的拒绝关键词，不应被误判
+                // 截断响应（stopReason=max_tokens）一定不是拒绝
+                const isShortResponse = fullResponse.trim().length < 500;
+                const startsWithRefusal = isRefusal(fullResponse.substring(0, 300));
+                const isActualRefusal = stopReason !== 'max_tokens' && (isShortResponse ? isRefusal(fullResponse) : startsWithRefusal);
+
+                if (isActualRefusal) {
                     console.log(`[Handler] Supressed complete refusal without tools: ${fullResponse.substring(0, 100)}...`);
                     textToSend = 'I understand the request. Let me proceed with the appropriate action. Could you clarify what specific task you would like me to perform?';
                 }
@@ -735,6 +905,8 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
 async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body: AnthropicRequest): Promise<void> {
     let fullText = await sendCursorRequestFull(cursorReq);
     const hasTools = (body.tools?.length ?? 0) > 0;
+    let activeCursorReq = cursorReq;
+    let retryCount = 0;
 
     console.log(`[Handler] 非流式原始响应 (${fullText.length} chars, tools=${hasTools}): ${fullText.substring(0, 300)}${fullText.length > 300 ? '...' : ''}`);
 
@@ -743,10 +915,11 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
 
     if (shouldRetry()) {
         for (let attempt = 0; attempt < MAX_REFUSAL_RETRIES; attempt++) {
-            console.log(`[Handler] 非流式：检测到拒绝（第${attempt + 1}次重试）...原始: ${fullText.substring(0, 100)}`);
+            retryCount++;
+            console.log(`[Handler] 非流式：检测到拒绝（第${retryCount}次重试）...原始: ${fullText.substring(0, 100)}`);
             const retryBody = buildRetryRequest(body, attempt);
-            const retryCursorReq = await convertToCursorRequest(retryBody);
-            fullText = await sendCursorRequestFull(retryCursorReq);
+            activeCursorReq = await convertToCursorRequest(retryBody);
+            fullText = await sendCursorRequestFull(activeCursorReq);
             if (!shouldRetry()) break;
         }
         if (shouldRetry()) {
@@ -763,6 +936,77 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
         }
     }
 
+    // ★ 极短响应重试（可能是连接中断）
+    if (hasTools && fullText.trim().length < 10 && retryCount < MAX_REFUSAL_RETRIES) {
+        retryCount++;
+        console.log(`[Handler] 非流式：响应过短 (${fullText.length} chars)，重试第${retryCount}次`);
+        activeCursorReq = await convertToCursorRequest(body);
+        fullText = await sendCursorRequestFull(activeCursorReq);
+        console.log(`[Handler] 非流式：重试响应 (${fullText.length} chars): ${fullText.substring(0, 200)}${fullText.length > 200 ? '...' : ''}`);
+    }
+
+    // ★ 内部截断续写（与流式路径对齐）
+    // Claude CLI 使用非流式模式时，写大文件最容易被截断
+    // 在 proxy 内部完成续写，确保工具调用参数完整
+    const MAX_AUTO_CONTINUE = 6;
+    let continueCount = 0;
+    const originalMessages = [...activeCursorReq.messages];
+
+    while (hasTools && isTruncated(fullText) && continueCount < MAX_AUTO_CONTINUE) {
+        continueCount++;
+        const prevLength = fullText.length;
+        console.log(`[Handler] ⚠️ 非流式：内部检测到截断 (${fullText.length} chars)，Proxy 将隐式请求无缝续写 (第${continueCount}次)...`);
+
+        const anchorLength = Math.min(300, fullText.length);
+        const anchorText = fullText.slice(-anchorLength);
+
+        const continuationPrompt = `Your previous response was cut off mid-output. The last part of your output was:
+
+\`\`\`
+...${anchorText}
+\`\`\`
+
+Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
+
+        const continuationReq: CursorChatRequest = {
+            ...activeCursorReq,
+            messages: [
+                ...originalMessages,
+                {
+                    parts: [{ type: 'text', text: fullText }],
+                    id: uuidv4(),
+                    role: 'assistant',
+                },
+                {
+                    parts: [{ type: 'text', text: continuationPrompt }],
+                    id: uuidv4(),
+                    role: 'user',
+                },
+            ],
+        };
+
+        const continuationResponse = await sendCursorRequestFull(continuationReq);
+
+        if (continuationResponse.trim().length === 0) {
+            console.log(`[Handler] ⚠️ 非流式续写返回空响应，停止续写`);
+            break;
+        }
+
+        // ★ 智能去重
+        const deduped = deduplicateContinuation(fullText, continuationResponse);
+        fullText += deduped;
+        if (deduped.length !== continuationResponse.length) {
+            console.log(`[Handler] 非流式续写去重: 移除了 ${continuationResponse.length - deduped.length} chars 的重复内容`);
+        }
+        console.log(`[Handler] 非流式续写拼接完成: ${prevLength} → ${fullText.length} chars (+${deduped.length})`);
+
+        // ★ 无进展检测：去重后没有新内容，停止续写
+        if (deduped.trim().length === 0) {
+            console.log(`[Handler] ⚠️ 非流式续写内容全部为重复，停止续写`);
+            break;
+        }
+    }
+
     const contentBlocks: AnthropicContentBlock[] = [];
     // ★ 截断检测：代码块/XML 未闭合时，返回 max_tokens 让 Claude Code 自动继续
     let stopReason = (hasTools && isTruncated(fullText)) ? 'max_tokens' : 'end_turn';
@@ -772,6 +1016,42 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
 
     if (hasTools) {
         let { toolCalls, cleanText } = parseToolCalls(fullText);
+
+        // ★ tool_choice=any 强制重试（与流式路径对齐）
+        const toolChoice = body.tool_choice;
+        const TOOL_CHOICE_MAX_RETRIES = 2;
+        let toolChoiceRetry = 0;
+        while (
+            toolChoice?.type === 'any' &&
+            toolCalls.length === 0 &&
+            toolChoiceRetry < TOOL_CHOICE_MAX_RETRIES
+        ) {
+            toolChoiceRetry++;
+            console.log(`[Handler] 非流式：tool_choice=any 但模型未调用工具（第${toolChoiceRetry}次），强制重试...`);
+
+            const forceMessages = [
+                ...activeCursorReq.messages,
+                {
+                    parts: [{ type: 'text' as const, text: fullText || '(no response)' }],
+                    id: uuidv4(),
+                    role: 'assistant' as const,
+                },
+                {
+                    parts: [{
+                        type: 'text' as const,
+                        text: `Your last response did not include any \`\`\`json action block. This is required because tool_choice is "any". You MUST respond using the json action format for at least one action. Do not explain yourself — just output the action block now.`,
+                    }],
+                    id: uuidv4(),
+                    role: 'user' as const,
+                },
+            ];
+            activeCursorReq = { ...activeCursorReq, messages: forceMessages };
+            fullText = await sendCursorRequestFull(activeCursorReq);
+            ({ toolCalls, cleanText } = parseToolCalls(fullText));
+        }
+        if (toolChoice?.type === 'any' && toolCalls.length === 0) {
+            console.log(`[Handler] 非流式：tool_choice=any 重试${TOOL_CHOICE_MAX_RETRIES}次后仍无工具调用`);
+        }
 
         if (toolCalls.length > 0) {
             stopReason = 'tool_use';
@@ -795,7 +1075,11 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
             }
         } else {
             let textToSend = fullText;
-            if (isRefusal(fullText)) {
+            // ★ 同样仅对短响应或开头匹配的进行拒绝压制
+            const isShort = fullText.trim().length < 500;
+            const startsRefusal = isRefusal(fullText.substring(0, 300));
+            const isRealRefusal = stopReason !== 'max_tokens' && (isShort ? isRefusal(fullText) : startsRefusal);
+            if (isRealRefusal) {
                 console.log(`[Handler] Supressed pure text refusal (non-stream): ${fullText.substring(0, 100)}...`);
                 textToSend = 'Let me proceed with the task.';
             }
@@ -814,9 +1098,9 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
         model: body.model,
         stop_reason: stopReason,
         stop_sequence: null,
-        usage: {
-            input_tokens: 100,
-            output_tokens: Math.ceil(fullText.length / 4),
+        usage: { 
+            input_tokens: estimateInputTokens(body), 
+            output_tokens: Math.ceil(fullText.length / 3) 
         },
     };
 

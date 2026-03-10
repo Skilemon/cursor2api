@@ -11,6 +11,7 @@
 
 import type { CursorChatRequest, CursorSSEEvent } from './types.js';
 import { getConfig } from './config.js';
+import { getProxyFetchOptions } from './proxy-agent.js';
 
 const CURSOR_CHAT_API = 'https://cursor.com/api/chat';
 
@@ -100,7 +101,8 @@ async function sendCursorRequestInner(
             headers,
             body: JSON.stringify(req),
             signal: controller.signal,
-        });
+            ...getProxyFetchOptions(),
+        } as any);
 
         if (!resp.ok) {
             const body = await resp.text();

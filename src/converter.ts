@@ -26,6 +26,42 @@ import { fixToolCallArguments } from './tool-fixer.js';
 // ==================== 工具指令构建 ====================
 
 /**
+ * 将 JSON Schema 压缩为紧凑的类型签名
+ * 目的：90 个工具的完整 JSON Schema 约 135,000 chars，压缩后约 15,000 chars
+ * 这直接影响 Cursor API 的输出预算（输入越大，输出越少）
+ *
+ * 示例：
+ *   完整: {"type":"object","properties":{"file_path":{"type":"string","description":"..."},"encoding":{"type":"string","enum":["utf-8","base64"]}},"required":["file_path"]}
+ *   压缩: {file_path!: string, encoding?: utf-8|base64}
+ */
+function compactSchema(schema: Record<string, unknown>): string {
+    if (!schema?.properties) return '{}';
+    const props = schema.properties as Record<string, Record<string, unknown>>;
+    const required = new Set((schema.required as string[]) || []);
+
+    const parts = Object.entries(props).map(([name, prop]) => {
+        let type = (prop.type as string) || 'any';
+        // enum 值直接展示（对正确生成参数至关重要）
+        if (prop.enum) {
+            type = (prop.enum as string[]).join('|');
+        }
+        // 数组类型标注 items 类型
+        if (type === 'array' && prop.items) {
+            const itemType = (prop.items as Record<string, unknown>).type || 'any';
+            type = `${itemType}[]`;
+        }
+        // 嵌套对象简写
+        if (type === 'object' && prop.properties) {
+            type = compactSchema(prop as Record<string, unknown>);
+        }
+        const req = required.has(name) ? '!' : '?';
+        return `${name}${req}: ${type}`;
+    });
+
+    return `{${parts.join(', ')}}`;
+}
+
+/**
  * 将工具定义构建为格式指令
  * 使用 Cursor IDE 原生场景融合：不覆盖模型身份，而是顺应它在 IDE 内的角色
  */
@@ -37,8 +73,12 @@ function buildToolInstructions(
     if (!tools || tools.length === 0) return '';
 
     const toolList = tools.map((tool) => {
-        const schema = tool.input_schema ? JSON.stringify(tool.input_schema) : '{}';
-        return `- **${tool.name}**: ${tool.description || 'No description'}\n  Schema: ${schema}`;
+        // ★ 使用紧凑 Schema 替代完整 JSON Schema 以大幅减小输入体积
+        const schema = tool.input_schema ? compactSchema(tool.input_schema) : '{}';
+        // 截断过长的工具描述（部分客户端的工具描述可达数千字符）
+        // ★ 80 chars 足矣：Schema 已包含参数信息，短描述减少输入体积，为输出留更多空间
+        const desc = (tool.description || 'No description').substring(0, 80);
+        return `- **${tool.name}**: ${desc}\n  Params: ${schema}`;
     }).join('\n');
 
     // ★ tool_choice 强制约束
@@ -248,29 +288,22 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
         }
     }
 
-    // ★ 智能压缩：工具模式下，总字符数超标时压缩老消息（而非丢弃）
-    // 保留完整的因果链（做了什么→得了什么），但大幅减少 token 占用
-    if (hasTools && messages.length > FEWSHOT_COUNT) {
-        const charsBefore = messages.reduce((s, m) => s + m.parts.reduce((a, p) => a + (p.text?.length ?? 0), 0), 0);
-
-        if (charsBefore > MAX_CONTEXT_CHARS || messages.length > MAX_CURSOR_MESSAGES) {
-            // 保留最近 KEEP_RECENT 条消息原文，之前的消息做压缩
-            const keepRecentCount = Math.min(KEEP_RECENT_MESSAGES, messages.length - FEWSHOT_COUNT);
-            const compressBoundary = messages.length - keepRecentCount;
-
-            let compressedCount = 0;
-            for (let i = FEWSHOT_COUNT; i < compressBoundary; i++) {
-                const original = messages[i].parts.map(p => p.text ?? '').join('');
-                const compressed = compressMessage(messages[i].role, original);
-                if (compressed.length < original.length) {
-                    messages[i] = { ...messages[i], parts: [{ type: 'text', text: compressed }] };
-                    compressedCount++;
+    // ★ 渐进式历史压缩（替代之前全删的智能压缩）
+    // 策略：保留最近 KEEP_RECENT 条消息完整，仅压缩早期消息中的超长文本
+    // 这不会丢失消息结构（不删消息），只缩短单条消息的文本，兼顾上下文完整性和输出空间
+    const KEEP_RECENT = 6; // 保留最近6条消息不压缩
+    const EARLY_MSG_MAX_CHARS = 2000; // 早期消息的最大字符数
+    if (messages.length > KEEP_RECENT + 2) { // +2 for few-shot messages
+        const compressEnd = messages.length - KEEP_RECENT;
+        for (let i = 2; i < compressEnd; i++) { // 从 index 2 开始跳过 few-shot
+            const msg = messages[i];
+            for (const part of msg.parts) {
+                if (part.text && part.text.length > EARLY_MSG_MAX_CHARS) {
+                    const originalLen = part.text.length;
+                    part.text = part.text.substring(0, EARLY_MSG_MAX_CHARS) +
+                        `\n\n... [truncated ${originalLen - EARLY_MSG_MAX_CHARS} chars for context budget]`;
+                    console.log(`[Converter] 📦 压缩早期消息 msg[${i}] (${msg.role}): ${originalLen} → ${part.text.length} chars`);
                 }
-            }
-
-            const charsAfter = messages.reduce((s, m) => s + m.parts.reduce((a, p) => a + (p.text?.length ?? 0), 0), 0);
-            if (compressedCount > 0) {
-                console.log(`[Converter] 🗜️ 上下文压缩: ${charsBefore} → ${charsAfter} chars (压缩 ${compressedCount} 条, 保留最近 ${keepRecentCount} 条原文)`);
             }
         }
     }
@@ -294,75 +327,10 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
 }
 
 // 最大工具结果长度（超过则截断，防止上下文溢出）
-const MAX_TOOL_RESULT_LENGTH = 30000;
+// ★ 15000 chars 平衡点：保留足够信息让模型理解结果，同时为输出留空间
+const MAX_TOOL_RESULT_LENGTH = 15000;
 
-// ==================== 上下文压缩配置 ====================
-const FEWSHOT_COUNT = 2;          // few-shot 消息数（头部固定保留）
-const MAX_CURSOR_MESSAGES = 30;   // 触发压缩的消息条数阈值
-const MAX_CONTEXT_CHARS = 60000;  // 触发压缩的总字符数阈值（约 15K tokens）
-const KEEP_RECENT_MESSAGES = 6;   // 保留最近 N 条消息为原文不压缩
-const COMPRESS_CONTENT_MAX = 200; // 压缩后单条消息最大字符数
 
-/**
- * 智能压缩单条消息内容
- * 保留因果链的语义信息，但大幅减少字符数
- */
-function compressMessage(role: string, text: string): string {
-    // 短消息不压缩
-    if (text.length <= COMPRESS_CONTENT_MAX) return text;
-
-    if (role === 'user') {
-        // 用户消息（通常是工具结果）
-        // 检测 "Action output:" 模式 — 工具执行结果
-        const actionMatch = text.match(/^Action output:\n([\s\S]*?)(?:\n\nBased on the output above|$)/);
-        if (actionMatch) {
-            const output = actionMatch[1];
-            // 提取文件名等关键信息
-            const firstLine = output.split('\n')[0]?.trim() || '';
-            const lineCount = output.split('\n').length;
-            return `Action output: [${output.length} chars, ${lineCount} lines] ${firstLine.substring(0, 80)}...`;
-        }
-        // 检测 "The action encountered an error:" 模式
-        const errorMatch = text.match(/^The action encountered an error:\n([\s\S]*?)(?:\n\nBased on the output above|$)/);
-        if (errorMatch) {
-            const errorText = errorMatch[1].substring(0, 150);
-            return `Action error: ${errorText}...`;
-        }
-        // 普通用户消息：保留前 200 字
-        return text.substring(0, COMPRESS_CONTENT_MAX) + `... [${text.length} chars total]`;
-    }
-
-    if (role === 'assistant') {
-        // 助手消息：提取工具调用名称，去掉大参数值
-        const toolBlocks = text.match(/```json action\s*\n([\s\S]*?)```/g);
-        if (toolBlocks && toolBlocks.length > 0) {
-            const summaries: string[] = [];
-            for (const block of toolBlocks) {
-                try {
-                    const jsonMatch = block.match(/```json action\s*\n([\s\S]*?)```/);
-                    if (jsonMatch) {
-                        const parsed = JSON.parse(jsonMatch[1]);
-                        const toolName = parsed.tool || parsed.name || 'unknown';
-                        // 只保留参数的 key，去掉大 value
-                        const paramKeys = parsed.parameters ? Object.keys(parsed.parameters) : [];
-                        summaries.push(`[Called ${toolName}(${paramKeys.join(', ')})]`);
-                    }
-                } catch {
-                    summaries.push('[Called action]');
-                }
-            }
-            // 保留工具调用前的说明文本（截短）
-            const cleanText = text.replace(/```json action\s*\n[\s\S]*?```/g, '').trim();
-            const briefText = cleanText.length > 100 ? cleanText.substring(0, 100) + '...' : cleanText;
-            return (briefText ? briefText + '\n' : '') + summaries.join('\n');
-        }
-        // 无工具调用的助手消息：截短
-        return text.substring(0, COMPRESS_CONTENT_MAX) + `... [${text.length} chars]`;
-    }
-
-    // 其他角色：截短
-    return text.substring(0, COMPRESS_CONTENT_MAX) + '...';
-}
 
 /**
  * 检查消息是否包含 tool_result 块
@@ -505,42 +473,45 @@ function tolerantParse(jsonStr: string): any {
 
     // 第二次尝试：处理字符串内的裸换行符、制表符
     let inString = false;
-    let escaped = false;
     let fixed = '';
     const bracketStack: string[] = []; // 跟踪 { 和 [ 的嵌套层级
 
     for (let i = 0; i < jsonStr.length; i++) {
         const char = jsonStr[i];
 
-        if (char === '\\' && !escaped) {
-            escaped = true;
+        // ★ 精确反斜杠计数：只有奇数个连续反斜杠后的引号才是转义的
+        if (char === '"') {
+            let backslashCount = 0;
+            for (let j = i - 1; j >= 0 && fixed[j] === '\\'; j--) {
+                backslashCount++;
+            }
+            if (backslashCount % 2 === 0) {
+                // 偶数个反斜杠 → 引号未被转义 → 切换字符串状态
+                inString = !inString;
+            }
             fixed += char;
-        } else if (char === '"' && !escaped) {
-            inString = !inString;
-            fixed += char;
-            escaped = false;
-        } else {
-            if (inString) {
-                // 裸控制字符转义
-                if (char === '\n') {
-                    fixed += '\\n';
-                } else if (char === '\r') {
-                    fixed += '\\r';
-                } else if (char === '\t') {
-                    fixed += '\\t';
-                } else {
-                    fixed += char;
-                }
+            continue;
+        }
+
+        if (inString) {
+            // 裸控制字符转义
+            if (char === '\n') {
+                fixed += '\\n';
+            } else if (char === '\r') {
+                fixed += '\\r';
+            } else if (char === '\t') {
+                fixed += '\\t';
             } else {
-                // 在字符串外跟踪括号层级
-                if (char === '{' || char === '[') {
-                    bracketStack.push(char === '{' ? '}' : ']');
-                } else if (char === '}' || char === ']') {
-                    if (bracketStack.length > 0) bracketStack.pop();
-                }
                 fixed += char;
             }
-            escaped = false;
+        } else {
+            // 在字符串外跟踪括号层级
+            if (char === '{' || char === '[') {
+                bracketStack.push(char === '{' ? '}' : ']');
+            } else if (char === '}' || char === ']') {
+                if (bracketStack.length > 0) bracketStack.pop();
+            }
+            fixed += char;
         }
     }
 
@@ -579,20 +550,21 @@ function tolerantParse(jsonStr: string): any {
                 let params: Record<string, unknown> = {};
                 if (paramsMatch) {
                     const paramsStr = paramsMatch[1];
-                    // 逐字符找到 parameters 对象的闭合 }
+                    // 逐字符找到 parameters 对象的闭合 }，使用精确反斜杠计数
                     let depth = 0;
                     let end = -1;
                     let pInString = false;
-                    let pEscaped = false;
                     for (let i = 0; i < paramsStr.length; i++) {
                         const c = paramsStr[i];
-                        if (c === '\\' && !pEscaped) { pEscaped = true; continue; }
-                        if (c === '"' && !pEscaped) { pInString = !pInString; }
+                        if (c === '"') {
+                            let bsc = 0;
+                            for (let j = i - 1; j >= 0 && paramsStr[j] === '\\'; j--) bsc++;
+                            if (bsc % 2 === 0) pInString = !pInString;
+                        }
                         if (!pInString) {
                             if (c === '{') depth++;
                             if (c === '}') { depth--; if (depth === 0) { end = i; break; } }
                         }
-                        pEscaped = false;
                     }
                     if (end > 0) {
                         const rawParams = paramsStr.substring(0, end + 1);
@@ -613,39 +585,174 @@ function tolerantParse(jsonStr: string): any {
             }
         } catch { /* ignore */ }
 
+        // ★ 第五次尝试：逆向贪婪提取大值字段
+        // 专门处理 Write/Edit 工具的 content 参数包含未转义引号导致 JSON 完全损坏的情况
+        // 策略：先找到 tool 名，然后对 content/command/text 等大值字段，
+        // 取该字段 "key": " 后面到最后一个可能的闭合点之间的所有内容
+        try {
+            const toolMatch2 = jsonStr.match(/["'](?:tool|name)["']\s*:\s*["']([^"']+)["']/);
+            if (toolMatch2) {
+                const toolName = toolMatch2[1];
+                const params: Record<string, unknown> = {};
+
+                // 大值字段列表（这些字段最容易包含有问题的内容）
+                const bigValueFields = ['content', 'command', 'text', 'new_string', 'new_str', 'file_text', 'code'];
+                // 小值字段仍用正则精确提取
+                const smallFieldRegex = /"(file_path|path|file|old_string|old_str|insert_line|mode|encoding|description|language|name)"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+                let sfm;
+                while ((sfm = smallFieldRegex.exec(jsonStr)) !== null) {
+                    params[sfm[1]] = sfm[2].replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\\\/g, '\\');
+                }
+
+                // 对大值字段进行贪婪提取：从 "content": " 开始，到倒数第二个 " 结束
+                for (const field of bigValueFields) {
+                    const fieldStart = jsonStr.indexOf(`"${field}"`);
+                    if (fieldStart === -1) continue;
+
+                    // 找到 ": " 后的第一个引号
+                    const colonPos = jsonStr.indexOf(':', fieldStart + field.length + 2);
+                    if (colonPos === -1) continue;
+                    const valueStart = jsonStr.indexOf('"', colonPos);
+                    if (valueStart === -1) continue;
+
+                    // 从末尾逆向查找：跳过可能的 }]} 和空白，找到值的结束引号
+                    let valueEnd = jsonStr.length - 1;
+                    // 跳过尾部的 }, ], 空白
+                    while (valueEnd > valueStart && /[}\]\s,]/.test(jsonStr[valueEnd])) {
+                        valueEnd--;
+                    }
+                    // 此时 valueEnd 应该指向值的结束引号
+                    if (jsonStr[valueEnd] === '"' && valueEnd > valueStart + 1) {
+                        const rawValue = jsonStr.substring(valueStart + 1, valueEnd);
+                        // 尝试解码 JSON 转义序列
+                        try {
+                            params[field] = JSON.parse(`"${rawValue}"`);
+                        } catch {
+                            // 如果解码失败，做基本替换
+                            params[field] = rawValue
+                                .replace(/\\n/g, '\n')
+                                .replace(/\\t/g, '\t')
+                                .replace(/\\r/g, '\r')
+                                .replace(/\\\\/g, '\\')
+                                .replace(/\\"/g, '"');
+                        }
+                    }
+                }
+
+                if (Object.keys(params).length > 0) {
+                    console.log(`[Converter] tolerantParse 逆向贪婪提取成功: tool=${toolName}, fields=[${Object.keys(params).join(', ')}]`);
+                    return { tool: toolName, parameters: params };
+                }
+            }
+        } catch { /* ignore */ }
+
         // 全部修复手段失败，重新抛出
         throw _e2;
     }
 }
 
+/**
+ * 从 ```json action 代码块中解析工具调用
+ *
+ * ★ 使用 JSON-string-aware 扫描器替代简单的正则匹配
+ * 原因：Write/Edit 工具的 content 参数经常包含 markdown 代码块（``` 标记），
+ * 简单的 lazy regex `/```json[\s\S]*?```/g` 会在 JSON 字符串内部的 ``` 处提前闭合，
+ * 导致工具参数被截断（例如一个 5000 字的文件只保留前几行）
+ */
 export function parseToolCalls(responseText: string): {
     toolCalls: ParsedToolCall[];
     cleanText: string;
 } {
     const toolCalls: ParsedToolCall[] = [];
-    let cleanText = responseText;
+    const blocksToRemove: Array<{ start: number; end: number }> = [];
 
-    const fullBlockRegex = /```json(?:\s+action)?\s*([\s\S]*?)\s*```/g;
+    // 查找所有 ```json (action)? 开头的位置
+    const openPattern = /```json(?:\s+action)?/g;
+    let openMatch: RegExpExecArray | null;
 
-    let match: RegExpExecArray | null;
-    while ((match = fullBlockRegex.exec(responseText)) !== null) {
-        let isToolCall = false;
-        try {
-            const parsed = tolerantParse(match[1]);
-            if (parsed.tool || parsed.name) {
-                const name = parsed.tool || parsed.name;
-                let args = parsed.parameters || parsed.arguments || parsed.input || {};
-                args = fixToolCallArguments(name, args);
-                toolCalls.push({ name, arguments: args });
-                isToolCall = true;
+    while ((openMatch = openPattern.exec(responseText)) !== null) {
+        const blockStart = openMatch.index;
+        const contentStart = blockStart + openMatch[0].length;
+
+        // 从内容起始处向前扫描，跳过 JSON 字符串内部的 ```
+        let pos = contentStart;
+        let inJsonString = false;
+        let closingPos = -1;
+
+        while (pos < responseText.length - 2) {
+            const char = responseText[pos];
+
+            if (char === '"') {
+                // ★ 精确反斜杠计数：计算引号前连续反斜杠的数量
+                // 只有奇数个反斜杠时引号才是被转义的
+                // 例如: \" → 转义(1个\), \\" → 未转义(2个\), \\\" → 转义(3个\)
+                let backslashCount = 0;
+                for (let j = pos - 1; j >= contentStart && responseText[j] === '\\'; j--) {
+                    backslashCount++;
+                }
+                if (backslashCount % 2 === 0) {
+                    // 偶数个反斜杠 → 引号未被转义 → 切换字符串状态
+                    inJsonString = !inJsonString;
+                }
+                pos++;
+                continue;
             }
-        } catch (e) {
-            console.error('[Converter] tolerantParse 失败:', e);
+
+            // 只在 JSON 字符串外部匹配闭合 ```
+            if (!inJsonString && responseText.substring(pos, pos + 3) === '```') {
+                closingPos = pos;
+                break;
+            }
+
+            pos++;
         }
 
-        if (isToolCall) {
-            cleanText = cleanText.replace(match[0], '');
+        if (closingPos >= 0) {
+            const jsonContent = responseText.substring(contentStart, closingPos).trim();
+            try {
+                const parsed = tolerantParse(jsonContent);
+                if (parsed.tool || parsed.name) {
+                    const name = parsed.tool || parsed.name;
+                    let args = parsed.parameters || parsed.arguments || parsed.input || {};
+                    args = fixToolCallArguments(name, args);
+                    toolCalls.push({ name, arguments: args });
+                    blocksToRemove.push({ start: blockStart, end: closingPos + 3 });
+                }
+            } catch (e) {
+                // 仅当内容看起来像工具调用时才报 error，否则可能只是普通 JSON 代码块（代码示例等）
+                const looksLikeToolCall = /["'](?:tool|name)["']\s*:/.test(jsonContent);
+                if (looksLikeToolCall) {
+                    console.error('[Converter] tolerantParse 失败（疑似工具调用）:', e);
+                } else {
+                    console.warn(`[Converter] 跳过非工具调用的 json 代码块 (${jsonContent.length} chars)`);
+                }
+            }
+        } else {
+            // 没有闭合 ``` — 代码块被截断，尝试解析已有内容
+            const jsonContent = responseText.substring(contentStart).trim();
+            if (jsonContent.length > 10) {
+                try {
+                    const parsed = tolerantParse(jsonContent);
+                    if (parsed.tool || parsed.name) {
+                        const name = parsed.tool || parsed.name;
+                        let args = parsed.parameters || parsed.arguments || parsed.input || {};
+                        args = fixToolCallArguments(name, args);
+                        toolCalls.push({ name, arguments: args });
+                        blocksToRemove.push({ start: blockStart, end: responseText.length });
+                        console.log(`[Converter] ⚠️ 从截断的代码块中恢复工具调用: ${name}`);
+                    }
+                } catch {
+                    console.log(`[Converter] 截断的代码块无法解析为工具调用`);
+                }
+            }
         }
+    }
+
+    // 从后往前移除已解析的代码块，保留 cleanText
+    let cleanText = responseText;
+    for (let i = blocksToRemove.length - 1; i >= 0; i--) {
+        const block = blocksToRemove[i];
+        cleanText = cleanText.substring(0, block.start) + cleanText.substring(block.end);
     }
 
     return { toolCalls, cleanText: cleanText.trim() };

@@ -25,10 +25,9 @@ const SMART_SINGLE_QUOTES = new Set([
 export function normalizeToolArguments(args: Record<string, unknown>): Record<string, unknown> {
     if (!args || typeof args !== 'object') return args;
 
-    if ('file_path' in args && !('path' in args)) {
-        args.path = args.file_path;
-        delete args.file_path;
-    }
+    // Removed legacy mapping that forcefully converted 'file_path' to 'path'.
+    // Claude Code 2.1.71 tools like 'Read' legitimately require 'file_path' as per their schema,
+    // and this legacy mapping causes infinite loop failures.
 
     return args;
 }

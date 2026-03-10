@@ -36,6 +36,7 @@ import {
     CLAUDE_IDENTITY_RESPONSE,
     CLAUDE_TOOLS_RESPONSE,
     MAX_REFUSAL_RETRIES,
+    estimateInputTokens,
 } from './handler.js';
 
 function chatId(): string {
@@ -622,9 +623,9 @@ async function handleOpenAINonStream(
             finish_reason: finishReason,
         }],
         usage: {
-            prompt_tokens: 100,
-            completion_tokens: Math.ceil(fullText.length / 4),
-            total_tokens: 100 + Math.ceil(fullText.length / 4),
+            prompt_tokens: estimateInputTokens(anthropicReq),
+            completion_tokens: Math.ceil(fullText.length / 3),
+            total_tokens: estimateInputTokens(anthropicReq) + Math.ceil(fullText.length / 3),
         },
     };
 
