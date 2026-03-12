@@ -54,22 +54,28 @@ async function fetchFromPool(): Promise<string> {
     return json.data.proxy;
 }
 
+// 异步锁：防止并发 allocate() 导致同一IP分配给多个 Worker
+let allocateLock: Promise<string> | null = null;
+
 /**
- * 从代理池获取一个当前未被分配的代理IP
+ * 从代理池获取一个当前未被分配的代理IP（串行执行，防竞态）
  */
-async function allocate(): Promise<string> {
-    cleanExpired();
-    for (let i = 0; i < MAX_FETCH_RETRIES; i++) {
-        const proxy = await fetchFromPool();
-        if (!leases.has(proxy)) {
-            const now = Date.now();
-            leases.set(proxy, { proxy, assignedAt: now, expiresAt: now + LEASE_TTL_MS });
-            console.log(`[Allocator] 分配代理: ${proxy}，当前共 ${leases.size} 个租约`);
-            return proxy;
+function allocate(): Promise<string> {
+    allocateLock = (allocateLock ?? Promise.resolve()).then(async () => {
+        cleanExpired();
+        for (let i = 0; i < MAX_FETCH_RETRIES; i++) {
+            const proxy = await fetchFromPool();
+            if (!leases.has(proxy)) {
+                const now = Date.now();
+                leases.set(proxy, { proxy, assignedAt: now, expiresAt: now + LEASE_TTL_MS });
+                console.log(`[Allocator] 分配代理: ${proxy}，当前共 ${leases.size} 个租约`);
+                return proxy;
+            }
+            console.log(`[Allocator] 代理重复，重试 (${i + 1}/${MAX_FETCH_RETRIES}): ${proxy}`);
         }
-        console.log(`[Allocator] 代理重复，重试 (${i + 1}/${MAX_FETCH_RETRIES}): ${proxy}`);
-    }
-    throw new Error(`无法获取不重复的代理，已重试 ${MAX_FETCH_RETRIES} 次`);
+        throw new Error(`无法获取不重复的代理，已重试 ${MAX_FETCH_RETRIES} 次`);
+    }).catch(err => { allocateLock = null; throw err; });
+    return allocateLock;
 }
 
 function release(proxy: string): void {
