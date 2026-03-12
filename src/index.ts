@@ -1,108 +1,121 @@
 /**
  * Cursor2API v2 - 入口
  *
- * 将 Cursor 文档页免费 AI 接口代理为 Anthropic Messages API
- * 通过提示词注入让 Claude Code 拥有完整工具调用能力
+ * 单容器多进程模式：
+ * - 主进程：启动内置代理分配服务 + 用 cluster 派生 Worker
+ * - Worker：各自独立持有一个代理IP，处理 HTTP 请求
+ * - cluster 自动将请求轮询分发给各 Worker
+ *
+ * 环境变量：
+ *   WORKERS=4        Worker 数量，默认 CPU 核心数
+ *   PROXY_POOL_URL   代理池API地址（多进程模式必填）
+ *   PROXY=...        静态代理（单进程模式用）
  */
 
 import 'dotenv/config';
+import cluster from 'cluster';
+import os from 'os';
 import { createRequire } from 'module';
-import express from 'express';
 import { getConfig } from './config.js';
-import { handleMessages, listModels, countTokens } from './handler.js';
-import { handleOpenAIChatCompletions, handleOpenAIResponses } from './openai-handler.js';
 
-// 从 package.json 读取版本号，统一来源，避免多处硬编码
 const require = createRequire(import.meta.url);
 const { version: VERSION } = require('../package.json') as { version: string };
 
+// ==================== 主进程 ====================
 
-const app = express();
-const config = getConfig();
+if (cluster.isPrimary) {
+    const config = getConfig();
+    const workerCount = parseInt(process.env.WORKERS || String(os.cpus().length));
+    const useAllocator = !!process.env.PROXY_POOL_URL;
 
-// 解析 JSON body（增大限制以支持 base64 图片，单张图片可达 10MB+）
-app.use(express.json({ limit: '50mb' }));
-
-// CORS
-app.use((_req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.header('Access-Control-Allow-Headers', '*');
-    if (_req.method === 'OPTIONS') {
-        res.sendStatus(200);
-        return;
-    }
-    next();
-});
-
-// ==================== 路由 ====================
-
-// Anthropic Messages API
-app.post('/v1/messages', handleMessages);
-app.post('/messages', handleMessages);
-
-// OpenAI Chat Completions API（兼容）
-app.post('/v1/chat/completions', handleOpenAIChatCompletions);
-app.post('/chat/completions', handleOpenAIChatCompletions);
-
-// OpenAI Responses API（Cursor IDE Agent 模式）
-app.post('/v1/responses', handleOpenAIResponses);
-app.post('/responses', handleOpenAIResponses);
-
-// Token 计数
-app.post('/v1/messages/count_tokens', countTokens);
-app.post('/messages/count_tokens', countTokens);
-
-// OpenAI 兼容模型列表
-app.get('/v1/models', listModels);
-
-// 健康检查
-app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', version: VERSION });
-});
-
-// 根路径
-app.get('/', (_req, res) => {
-    res.json({
-        name: 'cursor2api',
-        version: VERSION,
-        description: 'Cursor Docs AI → Anthropic & OpenAI & Cursor IDE API Proxy',
-        endpoints: {
-            anthropic_messages: 'POST /v1/messages',
-            openai_chat: 'POST /v1/chat/completions',
-            openai_responses: 'POST /v1/responses',
-            models: 'GET /v1/models',
-            health: 'GET /health',
-        },
-        usage: {
-            claude_code: 'export ANTHROPIC_BASE_URL=http://localhost:' + config.port,
-            openai_compatible: 'OPENAI_BASE_URL=http://localhost:' + config.port + '/v1',
-            cursor_ide: 'OPENAI_BASE_URL=http://localhost:' + config.port + '/v1 (选用 Claude 模型)',
-        },
-    });
-});
-
-// ==================== 启动 ====================
-
-app.listen(config.port, () => {
     console.log('');
     console.log('  ╔══════════════════════════════════════╗');
     console.log(`  ║        Cursor2API v${VERSION.padEnd(21)}║`);
     console.log('  ╠══════════════════════════════════════╣');
-    console.log(`  ║  Server:  http://localhost:${config.port}      ║`);
-    console.log('  ║  Model:   ' + config.cursorModel.padEnd(26) + '║');
-    console.log('  ╠══════════════════════════════════════╣');
-    console.log('  ║  API Endpoints:                      ║');
-    console.log('  ║  • Anthropic: /v1/messages            ║');
-    console.log('  ║  • OpenAI:   /v1/chat/completions     ║');
-    console.log('  ║  • Cursor:   /v1/responses            ║');
-    console.log('  ╠══════════════════════════════════════╣');
-    console.log('  ║  Claude Code:                        ║');
-    console.log(`  ║  export ANTHROPIC_BASE_URL=           ║`);
-    console.log(`  ║    http://localhost:${config.port}              ║`);
-    console.log('  ║  OpenAI / Cursor IDE:                 ║');
-    console.log(`  ║  OPENAI_BASE_URL=                     ║`);
-    console.log(`  ║    http://localhost:${config.port}/v1            ║`);
+    console.log(`  ║  Port:    ${String(config.port).padEnd(27)}║`);
+    console.log(`  ║  Workers: ${String(workerCount).padEnd(27)}║`);
+    console.log(`  ║  Proxy:   ${(useAllocator ? 'pool (allocator)' : (config.proxy || 'none')).padEnd(27)}║`);
     console.log('  ╚══════════════════════════════════════╝');
     console.log('');
-});
+
+    // 如果配置了代理池，先在主进程启动分配服务
+    if (useAllocator) {
+        const { startAllocatorServer } = await import('./proxy-allocator.js');
+        const allocatorPort = parseInt(process.env.ALLOCATOR_PORT || '3011');
+        startAllocatorServer(allocatorPort);
+        // 让 Worker 通过 localhost 访问分配服务
+        process.env.PROXY_ALLOCATOR_URL = `http://127.0.0.1:${allocatorPort}`;
+    }
+
+    // 派生 Worker
+    for (let i = 0; i < workerCount; i++) {
+        cluster.fork();
+    }
+
+    // Worker 退出时自动重启
+    cluster.on('exit', (worker, code, signal) => {
+        console.error(`[Cluster] Worker ${worker.process.pid} 退出 (code=${code}, signal=${signal})，重启中...`);
+        cluster.fork();
+    });
+
+} else {
+    // ==================== Worker 进程 ====================
+    await startWorker();
+}
+
+async function startWorker() {
+    const express = (await import('express')).default;
+    const { getConfig } = await import('./config.js');
+    const { initProxy } = await import('./proxy-agent.js');
+    const { handleMessages, listModels, countTokens } = await import('./handler.js');
+    const { handleOpenAIChatCompletions, handleOpenAIResponses } = await import('./openai-handler.js');
+
+    const config = getConfig();
+
+    // 初始化代理（从分配服务或静态配置）
+    await initProxy();
+
+    const app = express();
+    app.use(express.json({ limit: '50mb' }));
+
+    // CORS
+    app.use((_req, res, next) => {
+        res.header('Access-Control-Allow-Origin', '*');
+        res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.header('Access-Control-Allow-Headers', '*');
+        if (_req.method === 'OPTIONS') {
+            res.sendStatus(200);
+            return;
+        }
+        next();
+    });
+
+    // 路由
+    app.post('/v1/messages', handleMessages);
+    app.post('/messages', handleMessages);
+    app.post('/v1/chat/completions', handleOpenAIChatCompletions);
+    app.post('/chat/completions', handleOpenAIChatCompletions);
+    app.post('/v1/responses', handleOpenAIResponses);
+    app.post('/responses', handleOpenAIResponses);
+    app.post('/v1/messages/count_tokens', countTokens);
+    app.post('/messages/count_tokens', countTokens);
+    app.get('/v1/models', listModels);
+    app.get('/health', (_req, res) => res.json({ status: 'ok', version: VERSION, pid: process.pid }));
+    app.get('/', (_req, res) => {
+        res.json({
+            name: 'cursor2api',
+            version: VERSION,
+            endpoints: {
+                anthropic_messages: 'POST /v1/messages',
+                openai_chat: 'POST /v1/chat/completions',
+                openai_responses: 'POST /v1/responses',
+                models: 'GET /v1/models',
+                health: 'GET /health',
+            },
+        });
+    });
+
+    app.listen(config.port, () => {
+        console.log(`[Worker ${process.pid}] 已启动，监听 :${config.port}`);
+    });
+}

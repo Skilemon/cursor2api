@@ -25,6 +25,7 @@ export function getConfig(): AppConfig {
             if (yaml.port) config.port = yaml.port;
             if (yaml.timeout) config.timeout = yaml.timeout;
             if (yaml.proxy) config.proxy = yaml.proxy;
+            if (yaml.proxy_pool_url) config.proxyPoolUrl = yaml.proxy_pool_url;
             if (yaml.cursor_model) config.cursorModel = yaml.cursor_model;
             if (yaml.fingerprint) {
                 if (yaml.fingerprint.user_agent) config.fingerprint.userAgent = yaml.fingerprint.user_agent;
@@ -47,6 +48,7 @@ export function getConfig(): AppConfig {
     if (process.env.PORT) config.port = parseInt(process.env.PORT);
     if (process.env.TIMEOUT) config.timeout = parseInt(process.env.TIMEOUT);
     if (process.env.PROXY) config.proxy = process.env.PROXY;
+    if (process.env.PROXY_POOL_URL) config.proxyPoolUrl = process.env.PROXY_POOL_URL;
     if (process.env.CURSOR_MODEL) config.cursorModel = process.env.CURSOR_MODEL;
 
     // 从 base64 FP 环境变量解析指纹

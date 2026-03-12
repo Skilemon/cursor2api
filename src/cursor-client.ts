@@ -11,7 +11,7 @@
 
 import type { CursorChatRequest, CursorSSEEvent } from './types.js';
 import { getConfig } from './config.js';
-import { getProxyFetchOptions } from './proxy-agent.js';
+import { getProxyFetchOptions, rotateProxy } from './proxy-agent.js';
 
 const CURSOR_CHAT_API = 'https://cursor.com/api/chat';
 
@@ -59,6 +59,7 @@ export async function sendCursorRequest(
             console.error(`[Cursor] 请求失败 (${attempt}/${maxRetries}): ${msg}`);
             if (attempt < maxRetries) {
                 console.log(`[Cursor] 2s 后重试...`);
+                await rotateProxy();
                 await new Promise(r => setTimeout(r, 2000));
             } else {
                 throw err;
