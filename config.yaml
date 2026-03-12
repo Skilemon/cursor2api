@@ -19,7 +19,7 @@ proxy_pool_url: "http://172.17.0.6//api/getSingleProxy?delay=500"
 
 # Worker 进程数（多进程模式）
 # 默认使用 CPU 核心数，环境变量 WORKERS 优先级更高
-# workers: 4
+workers: 10
 
 # Cursor 使用的模型
 cursor_model: "anthropic/claude-sonnet-4.6"
