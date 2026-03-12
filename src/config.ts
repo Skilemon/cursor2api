@@ -9,7 +9,7 @@ export function getConfig(): AppConfig {
 
     // 默认配置
     config = {
-        port: 3010,
+        port: 3020,
         timeout: 120,
         cursorModel: 'anthropic/claude-sonnet-4.6',
         fingerprint: {
@@ -31,7 +31,7 @@ export function getConfig(): AppConfig {
             }
             if (yaml.vision) {
                 config.vision = {
-                    enabled: yaml.vision.enabled !== false, // default to true if vision section exists in some way
+                    enabled: yaml.vision.enabled === true, // only enable if explicitly set to true
                     mode: yaml.vision.mode || 'ocr',
                     baseUrl: yaml.vision.base_url || 'https://api.openai.com/v1/chat/completions',
                     apiKey: yaml.vision.api_key || '',

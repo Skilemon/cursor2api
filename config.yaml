@@ -6,6 +6,9 @@ port: 3010
 # 请求超时（秒）
 timeout: 120
 
+# API Key 验证（可选，留空则不校验）
+api_key: "sk-34e622003971ac167ca71e461743d9f7"
+
 # 代理设置（可选）
 # proxy: "http://127.0.0.1:7890"
 
@@ -15,17 +18,3 @@ cursor_model: "anthropic/claude-sonnet-4.6"
 # 浏览器指纹配置
 fingerprint:
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
-
-# 视觉处理降级配置（可选）
-# 如果开启，可以拦截您发给大模型的图片进行降级处理（因为目前免费 Cursor 不支持视觉）。
-vision:
-  enabled: true
-  # mode 选项: 'ocr' 或 'api'
-  # 'ocr': [默认模式] 彻底免 Key，零配置，完全依赖本机的 CPU 识图，提取文本、报错日志、代码段后发给大模型。
-  # 'api': 需要配置下方的 baseUrl 和 apiKey，把图发给外部视觉模型（如 Gemini、OpenRouter），能“看到”画面内容和色彩。
-  mode: 'ocr'
-  
-  # ---------- 以下选项仅在 mode: 'api' 时才生效 ----------
-  # base_url: "https://openrouter.ai/api/v1/chat/completions"
-  # api_key: "sk-or-v1-..."
-  # model: "meta-llama/llama-3.2-11b-vision-instruct:free"

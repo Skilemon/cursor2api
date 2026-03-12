@@ -2,7 +2,7 @@
  * openai-handler.ts - OpenAI Chat Completions API 兼容处理器
  *
  * 将 OpenAI 格式请求转换为内部 Anthropic 格式，复用现有 Cursor 交互管道
- * 支持流式和非流式响应、工具调用、Cursor IDE Agent 模式
+ * 支持流式和非流式响应、工具调用
  */
 
 import type { Request, Response } from 'express';
@@ -13,8 +13,6 @@ import type {
     OpenAIChatCompletion,
     OpenAIChatCompletionChunk,
     OpenAIToolCall,
-    OpenAIContentPart,
-    OpenAITool,
 } from './openai-types.js';
 import type {
     AnthropicRequest,
@@ -53,29 +51,28 @@ function toolCallId(): string {
  * 这样可以完全复用现有的 convertToCursorRequest 管道
  */
 function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
-    const rawMessages: AnthropicMessage[] = [];
+    const messages: AnthropicMessage[] = [];
     let systemPrompt: string | undefined;
 
     for (const msg of body.messages) {
         switch (msg.role) {
             case 'system':
+                // OpenAI system → Anthropic system
                 systemPrompt = (systemPrompt ? systemPrompt + '\n\n' : '') + extractOpenAIContent(msg);
                 break;
 
-            case 'user': {
-                // 检查 content 数组中是否有 tool_result 类型的块（Anthropic 风格）
-                const contentBlocks = extractOpenAIContentBlocks(msg);
-                if (Array.isArray(contentBlocks)) {
-                    rawMessages.push({ role: 'user', content: contentBlocks });
-                } else {
-                    rawMessages.push({ role: 'user', content: contentBlocks || '' });
-                }
+            case 'user':
+                messages.push({
+                    role: 'user',
+                    content: extractOpenAIContent(msg),
+                });
                 break;
-            }
 
             case 'assistant': {
+                // 助手消息可能包含 tool_calls
                 const blocks: AnthropicContentBlock[] = [];
                 const contentBlocks = extractOpenAIContentBlocks(msg);
+
                 if (typeof contentBlocks === 'string' && contentBlocks) {
                     blocks.push({ type: 'text', text: contentBlocks });
                 } else if (Array.isArray(contentBlocks)) {
@@ -99,15 +96,16 @@ function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
                     }
                 }
 
-                rawMessages.push({
+                messages.push({
                     role: 'assistant',
-                    content: blocks.length > 0 ? blocks : (typeof contentBlocks === 'string' ? contentBlocks : ''),
+                    content: blocks.length > 0 ? blocks : '',
                 });
                 break;
             }
 
             case 'tool': {
-                rawMessages.push({
+                // OpenAI tool result → Anthropic tool_result
+                messages.push({
                     role: 'user',
                     content: [{
                         type: 'tool_result',
@@ -120,33 +118,17 @@ function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
         }
     }
 
-    // 合并连续同角色消息（Anthropic API 要求 user/assistant 严格交替）
-    const messages = mergeConsecutiveRoles(rawMessages);
-
-    // 转换工具定义：支持 OpenAI 标准格式和 Cursor 扁平格式
-    const tools: AnthropicTool[] | undefined = body.tools?.map((t: OpenAITool | Record<string, unknown>) => {
-        // Cursor IDE 可能发送扁平格式：{ name, description, input_schema }
-        if ('function' in t && t.function) {
-            const fn = (t as OpenAITool).function;
-            return {
-                name: fn.name,
-                description: fn.description,
-                input_schema: fn.parameters || { type: 'object', properties: {} },
-            };
-        }
-        // Cursor 扁平格式
-        const flat = t as Record<string, unknown>;
-        return {
-            name: (flat.name as string) || '',
-            description: flat.description as string | undefined,
-            input_schema: (flat.input_schema as Record<string, unknown>) || { type: 'object', properties: {} },
-        };
-    });
+    // 转换工具定义：OpenAI function → Anthropic tool
+    const tools: AnthropicTool[] | undefined = body.tools?.map(t => ({
+        name: t.function.name,
+        description: t.function.description,
+        input_schema: t.function.parameters || { type: 'object', properties: {} },
+    }));
 
     return {
         model: body.model,
         messages,
-        max_tokens: Math.max(body.max_tokens || body.max_completion_tokens || 8192, 8192),
+        max_tokens: body.max_tokens || body.max_completion_tokens || 8192,
         stream: body.stream,
         system: systemPrompt,
         tools,
@@ -159,37 +141,6 @@ function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
 }
 
 /**
- * 合并连续同角色的消息（Anthropic API 要求角色严格交替）
- */
-function mergeConsecutiveRoles(messages: AnthropicMessage[]): AnthropicMessage[] {
-    if (messages.length <= 1) return messages;
-
-    const merged: AnthropicMessage[] = [];
-    for (const msg of messages) {
-        const last = merged[merged.length - 1];
-        if (last && last.role === msg.role) {
-            // 合并 content
-            const lastBlocks = toBlocks(last.content);
-            const newBlocks = toBlocks(msg.content);
-            last.content = [...lastBlocks, ...newBlocks];
-        } else {
-            merged.push({ ...msg });
-        }
-    }
-    return merged;
-}
-
-/**
- * 将 content 统一转为 AnthropicContentBlock 数组
- */
-function toBlocks(content: string | AnthropicContentBlock[]): AnthropicContentBlock[] {
-    if (typeof content === 'string') {
-        return content ? [{ type: 'text', text: content }] : [];
-    }
-    return content || [];
-}
-
-/**
  * 从 OpenAI 消息中提取文本或多模态内容块
  */
 function extractOpenAIContentBlocks(msg: OpenAIMessage): string | AnthropicContentBlock[] {
@@ -197,11 +148,11 @@ function extractOpenAIContentBlocks(msg: OpenAIMessage): string | AnthropicConte
     if (typeof msg.content === 'string') return msg.content;
     if (Array.isArray(msg.content)) {
         const blocks: AnthropicContentBlock[] = [];
-        for (const p of msg.content as (OpenAIContentPart | Record<string, unknown>)[]) {
-            if (p.type === 'text' && (p as OpenAIContentPart).text) {
-                blocks.push({ type: 'text', text: (p as OpenAIContentPart).text! });
-            } else if (p.type === 'image_url' && (p as OpenAIContentPart).image_url?.url) {
-                const url = (p as OpenAIContentPart).image_url!.url;
+        for (const p of msg.content) {
+            if (p.type === 'text' && p.text) {
+                blocks.push({ type: 'text', text: p.text });
+            } else if (p.type === 'image_url' && p.image_url?.url) {
+                const url = p.image_url.url;
                 if (url.startsWith('data:')) {
                     const match = url.match(/^data:([^;]+);base64,(.+)$/);
                     if (match) {
@@ -216,12 +167,6 @@ function extractOpenAIContentBlocks(msg: OpenAIMessage): string | AnthropicConte
                         source: { type: 'url', media_type: 'image/jpeg', data: url }
                     });
                 }
-            } else if (p.type === 'tool_use') {
-                // Anthropic 风格 tool_use 块直接透传
-                blocks.push(p as unknown as AnthropicContentBlock);
-            } else if (p.type === 'tool_result') {
-                // Anthropic 风格 tool_result 块直接透传
-                blocks.push(p as unknown as AnthropicContentBlock);
             }
         }
         return blocks.length > 0 ? blocks : '';
@@ -243,7 +188,14 @@ function extractOpenAIContent(msg: OpenAIMessage): string {
 export async function handleOpenAIChatCompletions(req: Request, res: Response): Promise<void> {
     const body = req.body as OpenAIChatRequest;
 
+    const lastUserMsg = body.messages?.slice().reverse().find((m: OpenAIMessage) => m.role === 'user');
+    const lastUserText = typeof lastUserMsg?.content === 'string'
+        ? lastUserMsg.content
+        : Array.isArray(lastUserMsg?.content)
+            ? lastUserMsg.content.filter((b: {type: string; text?: string}) => b.type === 'text').map((b: {type: string; text?: string}) => b.text).join(' ')
+            : '';
     console.log(`[OpenAI] 收到请求: model=${body.model}, messages=${body.messages?.length}, stream=${body.stream}, tools=${body.tools?.length ?? 0}`);
+    console.log(`[OpenAI] 最后用户消息: ${lastUserText.substring(0, 200)}${lastUserText.length > 200 ? '...' : ''}`);
 
     try {
         // Step 1: OpenAI → Anthropic 格式
@@ -352,7 +304,6 @@ async function handleOpenAIStream(
     });
 
     let fullResponse = '';
-    let sentText = '';
     let activeCursorReq = cursorReq;
     let retryCount = 0;
 
@@ -367,25 +318,18 @@ async function handleOpenAIStream(
 
     try {
         await executeStream();
+        console.log(`[OpenAI] 原始响应 (${fullResponse.length} chars): ${fullResponse.substring(0, 300)}${fullResponse.length > 300 ? '...' : ''}`);
 
-        console.log(`[OpenAI] 原始响应 (${fullResponse.length} chars, tools=${hasTools}): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
-
-        // 拒绝检测 + 自动重试（工具模式和非工具模式均生效）
-        const shouldRetryRefusal = () => {
-            if (!isRefusal(fullResponse)) return false;
-            if (hasTools && hasToolCalls(fullResponse)) return false;
-            return true;
-        };
-
-        while (shouldRetryRefusal() && retryCount < MAX_REFUSAL_RETRIES) {
-            retryCount++;
-            console.log(`[OpenAI] 检测到拒绝（第${retryCount}次），自动重试...原始: ${fullResponse.substring(0, 100)}`);
-            const retryBody = buildRetryRequest(anthropicReq, retryCount - 1);
-            activeCursorReq = await convertToCursorRequest(retryBody);
-            await executeStream();
-        }
-        if (shouldRetryRefusal()) {
-            if (!hasTools) {
+        // 无工具模式：检测拒绝并自动重试
+        if (!hasTools) {
+            while (isRefusal(fullResponse) && retryCount < MAX_REFUSAL_RETRIES) {
+                retryCount++;
+                console.log(`[OpenAI] 检测到拒绝（第${retryCount}次），自动重试...原始: ${fullResponse.substring(0, 80)}...`);
+                const retryBody = buildRetryRequest(anthropicReq, retryCount - 1);
+                activeCursorReq = await convertToCursorRequest(retryBody);
+                await executeStream();
+            }
+            if (isRefusal(fullResponse)) {
                 if (isToolCapabilityQuestion(anthropicReq)) {
                     console.log(`[OpenAI] 工具能力询问被拒绝，返回 Claude 能力描述`);
                     fullResponse = CLAUDE_TOOLS_RESPONSE;
@@ -393,24 +337,15 @@ async function handleOpenAIStream(
                     console.log(`[OpenAI] 重试${MAX_REFUSAL_RETRIES}次后仍被拒绝，返回 Claude 身份回复`);
                     fullResponse = CLAUDE_IDENTITY_RESPONSE;
                 }
-            } else {
-                console.log(`[OpenAI] 工具模式下拒绝且无工具调用，引导模型输出`);
-                fullResponse = 'I understand the request. Let me analyze the information and proceed with the appropriate action.';
             }
-        }
-
-        // 极短响应重试
-        if (hasTools && fullResponse.trim().length < 10 && retryCount < MAX_REFUSAL_RETRIES) {
-            retryCount++;
-            console.log(`[OpenAI] 响应过短 (${fullResponse.length} chars)，重试第${retryCount}次`);
-            activeCursorReq = await convertToCursorRequest(anthropicReq);
-            await executeStream();
         }
 
         let finishReason: 'stop' | 'tool_calls' = 'stop';
 
-        if (hasTools && hasToolCalls(fullResponse)) {
+        if (hasTools) {
             const { toolCalls, cleanText } = parseToolCalls(fullResponse);
+            console.log(`[OpenAI] 工具解析结果: ${toolCalls.length} 个工具调用, cleanText长度=${cleanText.length}`);
+            if (toolCalls.length > 0) console.log(`[OpenAI] 工具列表: ${toolCalls.map(t => t.name).join(', ')}`);
 
             if (toolCalls.length > 0) {
                 finishReason = 'tool_calls';
@@ -429,47 +364,27 @@ async function handleOpenAIStream(
                     });
                 }
 
-                // 增量流式发送工具调用：先发 name+id，再分块发 arguments
+                // 发送每个工具调用
                 for (let i = 0; i < toolCalls.length; i++) {
                     const tc = toolCalls[i];
-                    const tcId = toolCallId();
-                    const argsStr = JSON.stringify(tc.arguments);
-
-                    // 第一帧：发送 name + id， arguments 为空
                     writeOpenAISSE(res, {
                         id, object: 'chat.completion.chunk', created, model,
                         choices: [{
                             index: 0,
                             delta: {
-                                ...(i === 0 ? { content: null } : {}),
                                 tool_calls: [{
                                     index: i,
-                                    id: tcId,
+                                    id: toolCallId(),
                                     type: 'function',
-                                    function: { name: tc.name, arguments: '' },
+                                    function: {
+                                        name: tc.name,
+                                        arguments: JSON.stringify(tc.arguments),
+                                    },
                                 }],
                             },
                             finish_reason: null,
                         }],
                     });
-
-                    // 后续帧：分块发送 arguments (128 字节/帧)
-                    const CHUNK_SIZE = 128;
-                    for (let j = 0; j < argsStr.length; j += CHUNK_SIZE) {
-                        writeOpenAISSE(res, {
-                            id, object: 'chat.completion.chunk', created, model,
-                            choices: [{
-                                index: 0,
-                                delta: {
-                                    tool_calls: [{
-                                        index: i,
-                                        function: { arguments: argsStr.slice(j, j + CHUNK_SIZE) },
-                                    }],
-                                },
-                                finish_reason: null,
-                            }],
-                        });
-                    }
                 }
             } else {
                 // 误报：发送清洗后的文本
@@ -542,24 +457,19 @@ async function handleOpenAINonStream(
     let fullText = await sendCursorRequestFull(cursorReq);
     const hasTools = (body.tools?.length ?? 0) > 0;
 
-    console.log(`[OpenAI] 非流式原始响应 (${fullText.length} chars, tools=${hasTools}): ${fullText.substring(0, 300)}${fullText.length > 300 ? '...' : ''}`);
+    console.log(`[OpenAI] 原始响应 (${fullText.length} chars): ${fullText.substring(0, 300)}...`);
 
-    // 拒绝检测 + 自动重试（工具模式和非工具模式均生效）
-    const shouldRetry = () => isRefusal(fullText) && !(hasTools && hasToolCalls(fullText));
-
-    if (shouldRetry()) {
+    // 无工具模式：检测拒绝并自动重试
+    if (!hasTools && isRefusal(fullText)) {
         for (let attempt = 0; attempt < MAX_REFUSAL_RETRIES; attempt++) {
-            console.log(`[OpenAI] 非流式：检测到拒绝（第${attempt + 1}次重试）...原始: ${fullText.substring(0, 100)}`);
+            console.log(`[OpenAI] 非流式：检测到拒绝（第${attempt + 1}次重试）...原始: ${fullText.substring(0, 80)}...`);
             const retryBody = buildRetryRequest(anthropicReq, attempt);
             const retryCursorReq = await convertToCursorRequest(retryBody);
             fullText = await sendCursorRequestFull(retryCursorReq);
-            if (!shouldRetry()) break;
+            if (!isRefusal(fullText)) break;
         }
-        if (shouldRetry()) {
-            if (hasTools) {
-                console.log(`[OpenAI] 非流式：工具模式下拒绝，引导模型输出`);
-                fullText = 'I understand the request. Let me analyze the information and proceed with the appropriate action.';
-            } else if (isToolCapabilityQuestion(anthropicReq)) {
+        if (isRefusal(fullText)) {
+            if (isToolCapabilityQuestion(anthropicReq)) {
                 console.log(`[OpenAI] 非流式：工具能力询问被拒绝，返回 Claude 能力描述`);
                 fullText = CLAUDE_TOOLS_RESPONSE;
             } else {
@@ -635,134 +545,7 @@ async function handleOpenAINonStream(
 
 function writeOpenAISSE(res: Response, data: OpenAIChatCompletionChunk): void {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
-    if (typeof (res as unknown as { flush: () => void }).flush === 'function') {
-        (res as unknown as { flush: () => void }).flush();
-    }
+    // @ts-expect-error flush exists on ServerResponse when compression is used
+    if (typeof res.flush === 'function') res.flush();
 }
 
-// ==================== /v1/responses 支持 ====================
-
-/**
- * 处理 Cursor IDE Agent 模式的 /v1/responses 请求
- *
- * Cursor IDE 对 GPT 模型发送 OpenAI Responses API 格式请求，
- * 这里将其转换为 Chat Completions 格式后复用现有管道
- */
-export async function handleOpenAIResponses(req: Request, res: Response): Promise<void> {
-    try {
-        const body = req.body;
-        console.log(`[OpenAI] 收到 /v1/responses 请求: model=${body.model}`);
-
-        // 将 Responses API 格式转换为 Chat Completions 格式
-        const chatBody = responsesToChatCompletions(body);
-
-        // 此后复用现有管道
-        req.body = chatBody;
-        return handleOpenAIChatCompletions(req, res);
-    } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.error(`[OpenAI] /v1/responses 处理失败:`, message);
-        res.status(500).json({
-            error: { message, type: 'server_error', code: 'internal_error' },
-        });
-    }
-}
-
-/**
- * 将 OpenAI Responses API 格式转换为 Chat Completions 格式
- *
- * Responses API 使用 `input` 而非 `messages`，格式与 Chat Completions 不同
- */
-export function responsesToChatCompletions(body: Record<string, unknown>): OpenAIChatRequest {
-    const messages: OpenAIMessage[] = [];
-
-    // 系统指令
-    if (body.instructions && typeof body.instructions === 'string') {
-        messages.push({ role: 'system', content: body.instructions });
-    }
-
-    // 转换 input
-    const input = body.input;
-    if (typeof input === 'string') {
-        messages.push({ role: 'user', content: input });
-    } else if (Array.isArray(input)) {
-        for (const item of input as Record<string, unknown>[]) {
-            // function_call_output 没有 role 字段，必须先检查 type
-            if (item.type === 'function_call_output') {
-                messages.push({
-                    role: 'tool',
-                    content: (item.output as string) || '',
-                    tool_call_id: (item.call_id as string) || '',
-                });
-                continue;
-            }
-            const role = (item.role as string) || 'user';
-            if (role === 'system' || role === 'developer') {
-                const text = typeof item.content === 'string'
-                    ? item.content
-                    : Array.isArray(item.content)
-                        ? (item.content as Array<Record<string, unknown>>).filter(b => b.type === 'input_text').map(b => b.text as string).join('\n')
-                        : String(item.content || '');
-                messages.push({ role: 'system', content: text });
-            } else if (role === 'user') {
-                const content = typeof item.content === 'string'
-                    ? item.content
-                    : Array.isArray(item.content)
-                        ? (item.content as Array<Record<string, unknown>>).filter(b => b.type === 'input_text').map(b => b.text as string).join('\n')
-                        : String(item.content || '');
-                messages.push({ role: 'user', content });
-            } else if (role === 'assistant') {
-                const blocks = Array.isArray(item.content) ? item.content as Array<Record<string, unknown>> : [];
-                const text = blocks.filter(b => b.type === 'output_text').map(b => b.text as string).join('\n');
-                // 检查是否有工具调用
-                const toolCallBlocks = blocks.filter(b => b.type === 'function_call');
-                const toolCalls: OpenAIToolCall[] = toolCallBlocks.map(b => ({
-                    id: (b.call_id as string) || toolCallId(),
-                    type: 'function' as const,
-                    function: {
-                        name: (b.name as string) || '',
-                        arguments: (b.arguments as string) || '{}',
-                    },
-                }));
-                messages.push({
-                    role: 'assistant',
-                    content: text || null,
-                    ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
-                });
-            }
-        }
-    }
-
-    // 转换工具定义
-    const tools: OpenAITool[] | undefined = Array.isArray(body.tools)
-        ? (body.tools as Array<Record<string, unknown>>).map(t => {
-            if (t.type === 'function') {
-                return {
-                    type: 'function' as const,
-                    function: {
-                        name: (t.name as string) || '',
-                        description: t.description as string | undefined,
-                        parameters: t.parameters as Record<string, unknown> | undefined,
-                    },
-                };
-            }
-            return {
-                type: 'function' as const,
-                function: {
-                    name: (t.name as string) || '',
-                    description: t.description as string | undefined,
-                    parameters: t.parameters as Record<string, unknown> | undefined,
-                },
-            };
-        })
-        : undefined;
-
-    return {
-        model: (body.model as string) || 'gpt-4',
-        messages,
-        stream: (body.stream as boolean) ?? true,
-        temperature: body.temperature as number | undefined,
-        max_tokens: (body.max_output_tokens as number) || 8192,
-        tools,
-    };
-}

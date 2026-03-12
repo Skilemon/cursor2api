@@ -11,8 +11,8 @@ import type {
     AnthropicRequest,
     AnthropicResponse,
     AnthropicContentBlock,
+    AnthropicMessage,
     CursorChatRequest,
-    CursorMessage,
     CursorSSEEvent,
 } from './types.js';
 import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converter.js';
@@ -120,15 +120,10 @@ export function isRefusal(text: string): boolean {
 
 export function listModels(_req: Request, res: Response): void {
     const model = getConfig().cursorModel;
-    const now = Math.floor(Date.now() / 1000);
     res.json({
         object: 'list',
         data: [
-            { id: model, object: 'model', created: now, owned_by: 'anthropic' },
-            // Cursor IDE 推荐使用以下 Claude 模型名（避免走 /v1/responses 格式）
-            { id: 'claude-sonnet-4-5-20250929', object: 'model', created: now, owned_by: 'anthropic' },
-            { id: 'claude-sonnet-4-20250514', object: 'model', created: now, owned_by: 'anthropic' },
-            { id: 'claude-3-5-sonnet-20241022', object: 'model', created: now, owned_by: 'anthropic' },
+            { id: model, object: 'model', created: 1700000000, owned_by: 'anthropic' },
         ],
     });
 }
@@ -369,7 +364,15 @@ async function handleMockIdentityNonStream(res: Response, body: AnthropicRequest
 export async function handleMessages(req: Request, res: Response): Promise<void> {
     const body = req.body as AnthropicRequest;
 
+    const lastUserMsg = body.messages?.slice().reverse().find((m: AnthropicMessage) => m.role === 'user');
+    const lastUserText = typeof lastUserMsg?.content === 'string'
+        ? lastUserMsg.content
+        : Array.isArray(lastUserMsg?.content)
+            ? (lastUserMsg.content as AnthropicContentBlock[]).filter(b => b.type === 'text').map(b => b.text).join(' ')
+            : '';
     console.log(`[Handler] 收到请求: model=${body.model}, messages=${body.messages?.length}, stream=${body.stream}, tools=${body.tools?.length ?? 0}`);
+    console.log(`[Handler] 最后用户消息: ${lastUserText.substring(0, 200)}${lastUserText.length > 200 ? '...' : ''}`);
+    console.log(`[Handler] 完整请求体:`, JSON.stringify(body, null, 2));
 
     try {
         // 注意：图片预处理已移入 convertToCursorRequest → preprocessImages() 统一处理
@@ -398,30 +401,6 @@ export async function handleMessages(req: Request, res: Response): Promise<void>
             error: { type: 'api_error', message },
         });
     }
-}
-
-// ==================== 截断检测 ====================
-
-/**
- * 检测响应是否被 Cursor 上下文窗口截断
- * 截断症状：响应以句中断句结束，没有完整的句号/block 结束标志
- * 这是导致 Claude Code 频繁出现"继续"的根本原因
- */
-export function isTruncated(text: string): boolean {
-    if (!text || text.trim().length === 0) return false;
-    const trimmed = text.trimEnd();
-    // 代码块未闭合
-    const codeBlockOpen = (trimmed.match(/```/g) || []).length % 2 !== 0;
-    if (codeBlockOpen) return true;
-    // XML/HTML 标签未闭合 (Cursor 有时在中途截断)
-    const openTags = (trimmed.match(/^<[a-zA-Z]/gm) || []).length;
-    const closeTags = (trimmed.match(/^<\/[a-zA-Z]/gm) || []).length;
-    if (openTags > closeTags + 1) return true;
-    // 以逗号、分号、冒号、开括号结尾（明显未完成）
-    if (/[,;:\[{(]\s*$/.test(trimmed)) return true;
-    // 短响应且以小写字母结尾（句子被截断的强烈信号）
-    if (trimmed.length < 500 && /[a-z]$/.test(trimmed)) return false; // 短响应不判断
-    return false;
 }
 
 // ==================== 重试辅助 ====================
@@ -486,7 +465,6 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
     });
 
     let fullResponse = '';
-    let sentText = '';
     let blockIndex = 0;
     let textBlockStarted = false;
 
@@ -507,27 +485,19 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
 
     try {
         await executeStream();
+        console.log(`[Handler] Cursor API 完整响应 (${fullResponse.length} chars):`);
+        console.log(fullResponse);
 
-        console.log(`[Handler] 原始响应 (${fullResponse.length} chars, tools=${hasTools}): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
-
-        // 拒绝检测 + 自动重试（工具模式和非工具模式均生效）
-        const shouldRetryRefusal = () => {
-            if (!isRefusal(fullResponse)) return false;
-            if (hasTools && hasToolCalls(fullResponse)) return false;
-            return true;
-        };
-
-        while (shouldRetryRefusal() && retryCount < MAX_REFUSAL_RETRIES) {
-            retryCount++;
-            console.log(`[Handler] 检测到拒绝（第${retryCount}次），自动重试...原始: ${fullResponse.substring(0, 100)}`);
-            const retryBody = buildRetryRequest(body, retryCount - 1);
-            activeCursorReq = await convertToCursorRequest(retryBody);
-            await executeStream();
-            console.log(`[Handler] 重试响应 (${fullResponse.length} chars): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
-        }
-
-        if (shouldRetryRefusal()) {
-            if (!hasTools) {
+        // 无工具模式：检测拒绝并自动重试
+        if (!hasTools) {
+            while (isRefusal(fullResponse) && retryCount < MAX_REFUSAL_RETRIES) {
+                retryCount++;
+                console.log(`[Handler] 检测到身份拒绝（第${retryCount}次），自动重试...原始: ${fullResponse.substring(0, 80)}...`);
+                const retryBody = buildRetryRequest(body, retryCount - 1);
+                activeCursorReq = await convertToCursorRequest(retryBody);
+                await executeStream();
+            }
+            if (isRefusal(fullResponse)) {
                 // 工具能力询问 → 返回详细能力描述；其他 → 返回身份回复
                 if (isToolCapabilityQuestion(body)) {
                     console.log(`[Handler] 工具能力询问被拒绝，返回 Claude 能力描述`);
@@ -536,70 +506,35 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
                     console.log(`[Handler] 重试${MAX_REFUSAL_RETRIES}次后仍被拒绝，返回 Claude 身份回复`);
                     fullResponse = CLAUDE_IDENTITY_RESPONSE;
                 }
-            } else {
-                // 工具模式拒绝：不返回纯文本（会让 Claude Code 误认为任务完成）
-                // 返回一个合理的纯文本，让它以 end_turn 结束，Claude Code 会根据上下文继续
-                console.log(`[Handler] 工具模式下拒绝且无工具调用，返回简短引导文本`);
-                fullResponse = 'Let me proceed with the task.';
             }
         }
 
-        // 极短响应重试（可能是连接中断）
-        if (hasTools && fullResponse.trim().length < 10 && retryCount < MAX_REFUSAL_RETRIES) {
-            retryCount++;
-            console.log(`[Handler] 响应过短 (${fullResponse.length} chars)，重试第${retryCount}次`);
-            activeCursorReq = await convertToCursorRequest(body);
-            await executeStream();
-            console.log(`[Handler] 重试响应 (${fullResponse.length} chars): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
+        // 有工具模式：检测截断并自动重试
+        const MAX_TRUNCATION_RETRIES = 2;
+        if (hasTools) {
+            let truncationRetry = 0;
+            while (truncationRetry < MAX_TRUNCATION_RETRIES) {
+                const { toolCalls: tc } = parseToolCalls(fullResponse);
+                // 截断判断：有 ```json action 开头的块，但没有有效工具调用
+                // 说明响应里的 json action 块全部被截断了
+                const hasActionMarker = /```json\s+action/i.test(fullResponse);
+                const looksLikeTruncation = tc.length === 0 && hasActionMarker;
+                if (!looksLikeTruncation) break;
+                truncationRetry++;
+                console.log(`[Handler] 检测到截断响应（${fullResponse.length} chars，有action块但无有效工具调用），第${truncationRetry}次重试...`);
+                await executeStream();
+                console.log(`[Handler] 重试后响应 (${fullResponse.length} chars):`);
+                console.log(fullResponse);
+            }
         }
 
         // 流完成后，处理完整响应
-        // ★ 截断检测：代码块/XML 未闭合时，返回 max_tokens 让 Claude Code 自动继续
-        // 避免用户每次都要手动点击"继续"
-        let stopReason = (hasTools && isTruncated(fullResponse)) ? 'max_tokens' : 'end_turn';
-        if (stopReason === 'max_tokens') {
-            console.log(`[Handler] ⚠️ 检测到截断响应 (${fullResponse.length} chars)，设置 stop_reason=max_tokens`);
-        }
+        let stopReason = 'end_turn';
 
         if (hasTools) {
             let { toolCalls, cleanText } = parseToolCalls(fullResponse);
-
-            // ★ tool_choice=any 强制重试：如果模型没有输出任何工具调用块，追加强制消息重试
-            const toolChoice = body.tool_choice;
-            const TOOL_CHOICE_MAX_RETRIES = 2;
-            let toolChoiceRetry = 0;
-            while (
-                toolChoice?.type === 'any' &&
-                toolCalls.length === 0 &&
-                toolChoiceRetry < TOOL_CHOICE_MAX_RETRIES
-            ) {
-                toolChoiceRetry++;
-                console.log(`[Handler] tool_choice=any 但模型未调用工具（第${toolChoiceRetry}次），强制重试...`);
-
-                // 在现有 Cursor 请求中追加强制 user 消息（不重新转换整个请求，代价最小）
-                const forceMsg: CursorMessage = {
-                    parts: [{
-                        type: 'text',
-                        text: `Your last response did not include any \`\`\`json action block. This is required because tool_choice is "any". You MUST respond using the json action format for at least one action. Do not explain yourself — just output the action block now.`,
-                    }],
-                    id: uuidv4(),
-                    role: 'user',
-                };
-                activeCursorReq = {
-                    ...activeCursorReq,
-                    messages: [...activeCursorReq.messages, {
-                        parts: [{ type: 'text', text: fullResponse || '(no response)' }],
-                        id: uuidv4(),
-                        role: 'assistant',
-                    }, forceMsg],
-                };
-                await executeStream();
-                ({ toolCalls, cleanText } = parseToolCalls(fullResponse));
-            }
-            if (toolChoice?.type === 'any' && toolCalls.length === 0) {
-                console.log(`[Handler] tool_choice=any 重试${TOOL_CHOICE_MAX_RETRIES}次后仍无工具调用`);
-            }
-
+            console.log(`[Handler] 工具解析结果: ${toolCalls.length} 个工具调用, cleanText长度=${cleanText.length}`);
+            if (toolCalls.length > 0) console.log(`[Handler] 工具列表: ${toolCalls.map(t => t.name).join(', ')}`);
 
             if (toolCalls.length > 0) {
                 stopReason = 'tool_use';
@@ -611,7 +546,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
                 }
 
                 // Any clean text is sent as a single block before the tool blocks
-                const unsentCleanText = cleanText.substring(sentText.length).trim();
+                const unsentCleanText = cleanText.trim();
 
                 if (unsentCleanText) {
                     if (!textBlockStarted) {
@@ -623,7 +558,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
                     }
                     writeSSE(res, 'content_block_delta', {
                         type: 'content_block_delta', index: blockIndex,
-                        delta: { type: 'text_delta', text: (sentText && !sentText.endsWith('\n') ? '\n' : '') + unsentCleanText }
+                        delta: { type: 'text_delta', text: unsentCleanText }
                     });
                 }
 
@@ -643,16 +578,12 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
                         content_block: { type: 'tool_use', id: tcId, name: tc.name, input: {} },
                     });
 
-                    // 增量发送 input_json_delta（模拟 Anthropic 原生流式）
                     const inputJson = JSON.stringify(tc.arguments);
-                    const CHUNK_SIZE = 128;
-                    for (let j = 0; j < inputJson.length; j += CHUNK_SIZE) {
-                        writeSSE(res, 'content_block_delta', {
-                            type: 'content_block_delta',
-                            index: blockIndex,
-                            delta: { type: 'input_json_delta', partial_json: inputJson.slice(j, j + CHUNK_SIZE) },
-                        });
-                    }
+                    writeSSE(res, 'content_block_delta', {
+                        type: 'content_block_delta',
+                        index: blockIndex,
+                        delta: { type: 'input_json_delta', partial_json: inputJson },
+                    });
 
                     writeSSE(res, 'content_block_stop', {
                         type: 'content_block_stop', index: blockIndex,
@@ -669,7 +600,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
                     textToSend = 'I understand the request. Let me proceed with the appropriate action. Could you clarify what specific task you would like me to perform?';
                 }
 
-                const unsentText = textToSend.substring(sentText.length);
+                const unsentText = textToSend;
                 if (unsentText) {
                     if (!textBlockStarted) {
                         writeSSE(res, 'content_block_start', {
@@ -736,24 +667,20 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
     let fullText = await sendCursorRequestFull(cursorReq);
     const hasTools = (body.tools?.length ?? 0) > 0;
 
-    console.log(`[Handler] 非流式原始响应 (${fullText.length} chars, tools=${hasTools}): ${fullText.substring(0, 300)}${fullText.length > 300 ? '...' : ''}`);
+    console.log(`[Handler] Cursor API 完整响应 (${fullText.length} chars):`);
+    console.log(fullText);
 
-    // 拒绝检测 + 自动重试（工具模式和非工具模式均生效）
-    const shouldRetry = () => isRefusal(fullText) && !(hasTools && hasToolCalls(fullText));
-
-    if (shouldRetry()) {
+    // 无工具模式：检测拒绝并自动重试
+    if (!hasTools && isRefusal(fullText)) {
         for (let attempt = 0; attempt < MAX_REFUSAL_RETRIES; attempt++) {
-            console.log(`[Handler] 非流式：检测到拒绝（第${attempt + 1}次重试）...原始: ${fullText.substring(0, 100)}`);
+            console.log(`[Handler] 非流式：检测到身份拒绝（第${attempt + 1}次重试）...原始: ${fullText.substring(0, 80)}...`);
             const retryBody = buildRetryRequest(body, attempt);
             const retryCursorReq = await convertToCursorRequest(retryBody);
             fullText = await sendCursorRequestFull(retryCursorReq);
-            if (!shouldRetry()) break;
+            if (!isRefusal(fullText)) break;
         }
-        if (shouldRetry()) {
-            if (hasTools) {
-                console.log(`[Handler] 非流式：工具模式下拒绝，引导模型输出`);
-                fullText = 'I understand the request. Let me analyze the information and proceed with the appropriate action.';
-            } else if (isToolCapabilityQuestion(body)) {
+        if (isRefusal(fullText)) {
+            if (isToolCapabilityQuestion(body)) {
                 console.log(`[Handler] 非流式：工具能力询问被拒绝，返回 Claude 能力描述`);
                 fullText = CLAUDE_TOOLS_RESPONSE;
             } else {
@@ -764,11 +691,7 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
     }
 
     const contentBlocks: AnthropicContentBlock[] = [];
-    // ★ 截断检测：代码块/XML 未闭合时，返回 max_tokens 让 Claude Code 自动继续
-    let stopReason = (hasTools && isTruncated(fullText)) ? 'max_tokens' : 'end_turn';
-    if (stopReason === 'max_tokens') {
-        console.log(`[Handler] ⚠️ 非流式检测到截断响应 (${fullText.length} chars)，设置 stop_reason=max_tokens`);
-    }
+    let stopReason = 'end_turn';
 
     if (hasTools) {
         let { toolCalls, cleanText } = parseToolCalls(fullText);
@@ -797,7 +720,7 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
             let textToSend = fullText;
             if (isRefusal(fullText)) {
                 console.log(`[Handler] Supressed pure text refusal (non-stream): ${fullText.substring(0, 100)}...`);
-                textToSend = 'Let me proceed with the task.';
+                textToSend = 'I understand the request. Let me proceed with the appropriate action. Could you clarify what specific task you would like me to perform?';
             }
             contentBlocks.push({ type: 'text', text: textToSend });
         }
