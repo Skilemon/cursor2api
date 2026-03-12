@@ -25,7 +25,7 @@ const { version: VERSION } = require('../package.json') as { version: string };
 
 if (cluster.isPrimary) {
     const config = getConfig();
-    const workerCount = parseInt(process.env.WORKERS || String(os.cpus().length));
+    const workerCount = parseInt(process.env.WORKERS || '') || config.workers || os.cpus().length;
     const useAllocator = !!process.env.PROXY_POOL_URL;
 
     console.log('');

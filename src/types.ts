@@ -104,6 +104,7 @@ export interface AppConfig {
     timeout: number;
     proxy?: string;
     proxyPoolUrl?: string;
+    workers?: number;
     cursorModel: string;
     vision?: {
         enabled: boolean;

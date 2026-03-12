@@ -26,6 +26,7 @@ export function getConfig(): AppConfig {
             if (yaml.timeout) config.timeout = yaml.timeout;
             if (yaml.proxy) config.proxy = yaml.proxy;
             if (yaml.proxy_pool_url) config.proxyPoolUrl = yaml.proxy_pool_url;
+            if (yaml.workers) config.workers = yaml.workers;
             if (yaml.cursor_model) config.cursorModel = yaml.cursor_model;
             if (yaml.fingerprint) {
                 if (yaml.fingerprint.user_agent) config.fingerprint.userAgent = yaml.fingerprint.user_agent;
