@@ -41,13 +41,19 @@ if (cluster.isPrimary) {
     console.log('');
 
     // 如果配置了节点列表，启动多个 mihomo 进程（每个 Worker 独占一个）
+    let actualWorkerCount = workerCount;
     if (useMihomo) {
         const { startMihomo, getMihomoProxyUrls } = await import('./mihomo-manager.js');
         const instanceCount = await startMihomo(workerCount);
         if (instanceCount > 0) {
             const proxyUrls = getMihomoProxyUrls(instanceCount);
             process.env.PROXY_LIST = proxyUrls.join(',');
+            // Worker 数量与 mihomo 实例数对齐，避免多个 Worker 共用同一实例
+            actualWorkerCount = instanceCount;
             console.log(`[Main] mihomo 已启动，${instanceCount} 个实例，端口 7891-${7890 + instanceCount}`);
+            if (instanceCount < workerCount) {
+                console.warn(`[Main] 可用节点不足，Worker 数从 ${workerCount} 调整为 ${instanceCount}`);
+            }
         }
     }
 
@@ -61,7 +67,7 @@ if (cluster.isPrimary) {
     }
 
     // 派生 Worker，传入编号用于分配代理端口
-    for (let i = 0; i < workerCount; i++) {
+    for (let i = 0; i < actualWorkerCount; i++) {
         cluster.fork({ WORKER_INDEX: String(i) });
     }
 
