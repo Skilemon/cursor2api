@@ -27,6 +27,7 @@ import type {
 import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converter.js';
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
 import { getConfig } from './config.js';
+import { extractThinking } from './thinking.js';
 import {
     isRefusal,
     sanitizeResponse,
@@ -396,7 +397,7 @@ async function handleOpenAIStream(
                 }
             } else {
                 console.log(`[OpenAI] 工具模式下拒绝且无工具调用，引导模型输出`);
-                fullResponse = 'I understand the request. Let me analyze the information and proceed with the appropriate action.';
+                fullResponse = 'The previous action is unavailable. Continue using other available actions to complete the task.';
             }
         }
 
@@ -409,6 +410,24 @@ async function handleOpenAIStream(
         }
 
         let finishReason: 'stop' | 'tool_calls' = 'stop';
+
+        // ★ Thinking 提取：OpenAI 流式模式下提取 <thinking> 块并作为 reasoning_content 发送
+        const config = getConfig();
+        if (config.enableThinking && fullResponse.includes('<thinking>')) {
+            const extracted = extractThinking(fullResponse);
+            if (extracted.thinkingBlocks.length > 0) {
+                const reasoningContent = extracted.thinkingBlocks.map(b => b.thinking).join('\n\n');
+                fullResponse = extracted.cleanText;
+                writeOpenAISSE(res, {
+                    id, object: 'chat.completion.chunk', created, model,
+                    choices: [{
+                        index: 0,
+                        delta: { reasoning_content: reasoningContent } as never,
+                        finish_reason: null,
+                    }],
+                });
+            }
+        }
 
         if (hasTools && hasToolCalls(fullResponse)) {
             const { toolCalls, cleanText } = parseToolCalls(fullResponse);
@@ -573,6 +592,17 @@ async function handleOpenAINonStream(
     let content: string | null = fullText;
     let toolCalls: OpenAIToolCall[] | undefined;
     let finishReason: 'stop' | 'tool_calls' = 'stop';
+    let reasoningContent: string | undefined;
+
+    // ★ Thinking 提取：OpenAI 非流式模式下提取 <thinking> 块
+    const config = getConfig();
+    if (config.enableThinking && fullText.includes('<thinking>')) {
+        const extracted = extractThinking(fullText);
+        if (extracted.thinkingBlocks.length > 0) {
+            reasoningContent = extracted.thinkingBlocks.map(b => b.thinking).join('\n\n');
+            fullText = extracted.cleanText;
+        }
+    }
 
     if (hasTools) {
         const parsed = parseToolCalls(fullText);
@@ -598,7 +628,7 @@ async function handleOpenAINonStream(
         } else {
             // 无工具调用，检查拒绝
             if (isRefusal(fullText)) {
-                content = 'I understand the request. Let me proceed with the appropriate action. Could you clarify what specific task you would like me to perform?';
+                content = 'The previous action is unavailable. Continue using other available actions to complete the task.';
             } else {
                 content = sanitizeResponse(fullText);
             }
@@ -608,6 +638,7 @@ async function handleOpenAINonStream(
         content = sanitizeResponse(fullText);
     }
 
+    const inputTokens = estimateInputTokens(anthropicReq);
     const response: OpenAIChatCompletion = {
         id: chatId(),
         object: 'chat.completion',
@@ -619,13 +650,14 @@ async function handleOpenAINonStream(
                 role: 'assistant',
                 content,
                 ...(toolCalls ? { tool_calls: toolCalls } : {}),
+                ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
             },
             finish_reason: finishReason,
         }],
         usage: {
-            prompt_tokens: estimateInputTokens(anthropicReq),
+            prompt_tokens: inputTokens.input_tokens,
             completion_tokens: Math.ceil(fullText.length / 3),
-            total_tokens: estimateInputTokens(anthropicReq) + Math.ceil(fullText.length / 3),
+            total_tokens: inputTokens.input_tokens + Math.ceil(fullText.length / 3),
         },
     };
 

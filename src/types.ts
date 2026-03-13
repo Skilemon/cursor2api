@@ -29,8 +29,11 @@ export interface AnthropicMessage {
 }
 
 export interface AnthropicContentBlock {
-    type: 'text' | 'tool_use' | 'tool_result' | 'image';
+    type: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'image';
     text?: string;
+    // thinking fields (Anthropic extended thinking)
+    thinking?: string;
+    signature?: string;
     // image fields
     source?: { type: string; media_type?: string; data: string };
     // tool_use fields
@@ -57,7 +60,7 @@ export interface AnthropicResponse {
     model: string;
     stop_reason: string;
     stop_sequence: string | null;
-    usage: { input_tokens: number; output_tokens: number };
+    usage: { input_tokens: number; output_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number };
 }
 
 // ==================== Cursor API Types ====================
@@ -68,6 +71,8 @@ export interface CursorChatRequest {
     id: string;
     messages: CursorMessage[];
     trigger: string;
+    maxTokens?: number;
+    max_tokens?: number;
 }
 
 export interface CursorContext {
@@ -110,6 +115,7 @@ export interface AppConfig {
     mihomo?: string;
     workers?: number;
     cursorModel: string;
+    enableThinking?: boolean;
     vision?: {
         enabled: boolean;
         mode: 'ocr' | 'api';

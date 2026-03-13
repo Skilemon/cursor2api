@@ -12,6 +12,7 @@ export function getConfig(): AppConfig {
         port: 3010,
         timeout: 120,
         cursorModel: 'anthropic/claude-sonnet-4.6',
+        enableThinking: true,
         fingerprint: {
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
         },
@@ -32,6 +33,7 @@ export function getConfig(): AppConfig {
             if (yaml.mihomo) config.mihomo = yaml.mihomo;
             if (yaml.workers) config.workers = yaml.workers;
             if (yaml.cursor_model) config.cursorModel = yaml.cursor_model;
+            if (yaml.enable_thinking !== undefined) config.enableThinking = yaml.enable_thinking;
             if (yaml.fingerprint) {
                 if (yaml.fingerprint.user_agent) config.fingerprint.userAgent = yaml.fingerprint.user_agent;
             }
@@ -55,6 +57,7 @@ export function getConfig(): AppConfig {
     if (process.env.PROXY) config.proxy = process.env.PROXY;
     if (process.env.PROXY_POOL_URL) config.proxyPoolUrl = process.env.PROXY_POOL_URL;
     if (process.env.CURSOR_MODEL) config.cursorModel = process.env.CURSOR_MODEL;
+    if (process.env.ENABLE_THINKING !== undefined) config.enableThinking = process.env.ENABLE_THINKING !== 'false';
 
     // 从 base64 FP 环境变量解析指纹
     if (process.env.FP) {
