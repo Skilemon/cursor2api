@@ -26,6 +26,10 @@ export function getConfig(): AppConfig {
             if (yaml.timeout) config.timeout = yaml.timeout;
             if (yaml.proxy) config.proxy = yaml.proxy;
             if (yaml.proxy_pool_url) config.proxyPoolUrl = yaml.proxy_pool_url;
+            if (Array.isArray(yaml.proxy_list) && yaml.proxy_list.length > 0) config.proxyList = yaml.proxy_list;
+            if (Array.isArray(yaml.nodes) && yaml.nodes.length > 0) config.nodes = yaml.nodes;
+            if (yaml.subscription) config.subscription = yaml.subscription;
+            if (yaml.mihomo) config.mihomo = yaml.mihomo;
             if (yaml.workers) config.workers = yaml.workers;
             if (yaml.cursor_model) config.cursorModel = yaml.cursor_model;
             if (yaml.fingerprint) {

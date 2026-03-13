@@ -34,9 +34,22 @@ if (cluster.isPrimary) {
     console.log('  ╠══════════════════════════════════════╣');
     console.log(`  ║  Port:    ${String(config.port).padEnd(27)}║`);
     console.log(`  ║  Workers: ${String(workerCount).padEnd(27)}║`);
-    console.log(`  ║  Proxy:   ${(useAllocator ? 'pool (allocator)' : (config.proxy || 'none')).padEnd(27)}║`);
+    const useMihomo = !!(config.subscription || (config.nodes && config.nodes.length > 0));
+    const proxyDisplay = useAllocator ? 'pool (allocator)' : useMihomo ? 'mihomo (per-node ports)' : (config.proxy || 'none');
+    console.log(`  ║  Proxy:   ${proxyDisplay.padEnd(27)}║`);
     console.log('  ╚══════════════════════════════════════╝');
     console.log('');
+
+    // 如果配置了节点列表，启动多个 mihomo 进程（每个 Worker 独占一个）
+    if (useMihomo) {
+        const { startMihomo, getMihomoProxyUrls } = await import('./mihomo-manager.js');
+        const instanceCount = await startMihomo(workerCount);
+        if (instanceCount > 0) {
+            const proxyUrls = getMihomoProxyUrls(instanceCount);
+            process.env.PROXY_LIST = proxyUrls.join(',');
+            console.log(`[Main] mihomo 已启动，${instanceCount} 个实例，端口 7891-${7890 + instanceCount}`);
+        }
+    }
 
     // 如果配置了代理池，先在主进程启动分配服务
     if (useAllocator) {
@@ -47,16 +60,28 @@ if (cluster.isPrimary) {
         process.env.PROXY_ALLOCATOR_URL = `http://127.0.0.1:${allocatorPort}`;
     }
 
-    // 派生 Worker
+    // 派生 Worker，传入编号用于分配代理端口
     for (let i = 0; i < workerCount; i++) {
-        cluster.fork();
+        cluster.fork({ WORKER_INDEX: String(i) });
     }
 
-    // Worker 退出时自动重启
+    // Worker 退出时自动重启，透传原 WORKER_INDEX 保持代理绑定关系
     cluster.on('exit', (worker, code, signal) => {
         console.error(`[Cluster] Worker ${worker.process.pid} 退出 (code=${code}, signal=${signal})，重启中...`);
-        cluster.fork();
+        const workerIndex = worker.process.env?.WORKER_INDEX ?? '0';
+        cluster.fork({ WORKER_INDEX: workerIndex });
     });
+
+    // 主进程退出时清理 mihomo 子进程
+    if (useMihomo) {
+        const cleanup = async () => {
+            const { stopMihomo } = await import('./mihomo-manager.js');
+            stopMihomo();
+            process.exit(0);
+        };
+        process.once('SIGTERM', cleanup);
+        process.once('SIGINT', cleanup);
+    }
 
 } else {
     // ==================== Worker 进程 ====================

@@ -4,14 +4,14 @@
  * 职责：
  * 1. 发送请求到 https://cursor.com/api/chat（带 Chrome TLS 指纹模拟 headers）
  * 2. 流式解析 SSE 响应
- * 3. 自动重试（最多 2 次）
+ * 3. 自动重试（最多 5 次）
  *
  * 注：x-is-human token 验证已被 Cursor 停用，直接发送空字符串即可。
  */
 
 import type { CursorChatRequest, CursorSSEEvent } from './types.js';
 import { getConfig } from './config.js';
-import { getProxyFetchOptions, rotateProxy } from './proxy-agent.js';
+import { getProxyFetchOptions, rotateProxy, getCurrentProxyUrl } from './proxy-agent.js';
 
 const CURSOR_CHAT_API = 'https://cursor.com/api/chat';
 
@@ -49,7 +49,7 @@ export async function sendCursorRequest(
     req: CursorChatRequest,
     onChunk: (event: CursorSSEEvent) => void,
 ): Promise<void> {
-    const maxRetries = 2;
+    const maxRetries = 5;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
             await sendCursorRequestInner(req, onChunk);
@@ -57,10 +57,16 @@ export async function sendCursorRequest(
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             console.error(`[Cursor] 请求失败 (${attempt}/${maxRetries}): ${msg}`);
+            // 4xx 错误（除 429）换代理也无法解决，直接抛出
+            const httpMatch = msg.match(/HTTP (\d+)/);
+            if (httpMatch) {
+                const status = parseInt(httpMatch[1]);
+                if (status >= 400 && status < 500 && status !== 429) {
+                    throw err;
+                }
+            }
             if (attempt < maxRetries) {
-                console.log(`[Cursor] 2s 后重试...`);
                 await rotateProxy();
-                await new Promise(r => setTimeout(r, 2000));
             } else {
                 throw err;
             }
@@ -74,15 +80,21 @@ async function sendCursorRequestInner(
 ): Promise<void> {
     const headers = getChromeHeaders();
 
-    console.log(`[Cursor] 发送请求: model=${req.model}, messages=${req.messages.length}`);
+    const proxyInfo = getCurrentProxyUrl() ?? 'none';
+    console.log(`[Cursor] 发送请求: model=${req.model}, messages=${req.messages.length}, proxy=${proxyInfo}`);
 
     const config = getConfig();
     const controller = new AbortController();
 
-    // ★ 空闲超时（Idle Timeout）：用读取活动检测替换固定总时长超时。
-    // 每次收到新数据时重置计时器，只有在指定时间内完全无数据到达时才中断。
-    // 这样长输出（如写长文章、大量工具调用）不会因总时长超限被误杀。
-    const IDLE_TIMEOUT_MS = config.timeout * 1000; // 复用 timeout 配置作为空闲超时阈值
+    // 连接超时：等待服务器开始响应的最长时间（TCP+TLS+首字节）
+    const CONNECT_TIMEOUT_MS = 15000;
+    let connectTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+        console.warn('[Cursor] 连接超时（15s 未收到响应头），中止请求');
+        controller.abort();
+    }, CONNECT_TIMEOUT_MS);
+
+    // 空闲超时：流式读取时，指定时间内无新数据则中断
+    const IDLE_TIMEOUT_MS = config.timeout * 1000;
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
     const resetIdleTimer = () => {
@@ -93,9 +105,6 @@ async function sendCursorRequestInner(
         }, IDLE_TIMEOUT_MS);
     };
 
-    // 启动初始计时（等待服务器开始响应）
-    resetIdleTimer();
-
     try {
         const resp = await fetch(CURSOR_CHAT_API, {
             method: 'POST',
@@ -104,6 +113,12 @@ async function sendCursorRequestInner(
             signal: controller.signal,
             ...getProxyFetchOptions(),
         } as any);
+
+        // 已收到响应头，清除连接超时，改用空闲超时保护流式读取
+        if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+        resetIdleTimer();
+
+        console.log(`[Cursor] 收到响应头: HTTP ${resp.status} ${resp.statusText}`);
 
         if (!resp.ok) {
             const body = await resp.text();
@@ -118,6 +133,26 @@ async function sendCursorRequestInner(
         const reader = resp.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
+        let eventCount = 0;
+        let textDeltaCount = 0;
+        const otherEvents: string[] = [];
+
+        const processEvent = (data: string) => {
+            if (data === '[DONE]') return;
+            try {
+                const event: CursorSSEEvent = JSON.parse(data);
+                eventCount++;
+                if (event.type === 'text-delta') {
+                    textDeltaCount++;
+                } else {
+                    otherEvents.push(data);
+                }
+                onChunk(event);
+            } catch {
+                // 非 JSON 数据，原样记录
+                otherEvents.push(data);
+            }
+        };
 
         while (true) {
             const { done, value } = await reader.read();
@@ -134,27 +169,28 @@ async function sendCursorRequestInner(
                 if (!line.startsWith('data: ')) continue;
                 const data = line.slice(6).trim();
                 if (!data) continue;
-
-                try {
-                    const event: CursorSSEEvent = JSON.parse(data);
-                    onChunk(event);
-                } catch {
-                    // 非 JSON 数据，忽略
-                }
+                processEvent(data);
             }
         }
 
         // 处理剩余 buffer
         if (buffer.startsWith('data: ')) {
             const data = buffer.slice(6).trim();
-            if (data) {
-                try {
-                    const event: CursorSSEEvent = JSON.parse(data);
-                    onChunk(event);
-                } catch { /* ignore */ }
+            if (data) processEvent(data);
+        }
+
+        console.log(`[Cursor] 流读取完成: 共${eventCount}个事件, text-delta=${textDeltaCount}`);
+        if (textDeltaCount === 0 && otherEvents.length > 0) {
+            console.warn(`[Cursor] 无 text-delta 事件，收到的其他事件:`);
+            for (const e of otherEvents) {
+                console.warn(`  ${e}`);
             }
         }
+        if (eventCount === 0) {
+            throw new Error('Cursor 返回空响应（0个SSE事件），可能被代理拦截或账号异常');
+        }
     } finally {
+        if (connectTimer) clearTimeout(connectTimer);
         if (idleTimer) clearTimeout(idleTimer);
     }
 }

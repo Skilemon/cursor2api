@@ -104,6 +104,10 @@ export interface AppConfig {
     timeout: number;
     proxy?: string;
     proxyPoolUrl?: string;
+    proxyList?: string[];
+    nodes?: string[];
+    subscription?: string;
+    mihomo?: string;
     workers?: number;
     cursorModel: string;
     vision?: {

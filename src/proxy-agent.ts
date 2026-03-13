@@ -14,6 +14,10 @@ import { getConfig } from './config.js';
 
 let cachedAgent: ProxyAgent | Agent | undefined;
 let currentProxyUrl: string | undefined;
+
+export function getCurrentProxyUrl(): string | undefined {
+    return currentProxyUrl;
+}
 let renewTimer: ReturnType<typeof setInterval> | undefined;
 
 // 续约间隔：LEASE_TTL 的一半，默认30秒
@@ -116,7 +120,7 @@ function createSocksAgent(proxyUrl: string): Agent {
                 {
                     proxy: socksProxy,
                     command: 'connect',
-                    destination: { host: hostname, port: parseInt(port) },
+                    destination: { host: hostname, port: parseInt(port) || (protocol === 'https:' ? 443 : 80) },
                 },
                 (err, info) => {
                     if (err || !info) return callback(err ?? new Error('SOCKS connection failed'), null);
@@ -180,8 +184,16 @@ export async function initProxy(force = false): Promise<void> {
         cachedAgent = isSocksProxy(proxyUrl) ? createSocksAgent(proxyUrl) : new ProxyAgent(proxyUrl);
         console.log(`[Proxy] 代理池获取代理: ${proxyUrl}`);
 
+    } else if (process.env.PROXY_LIST) {
+        // 模式3：每个 Worker 固定使用自己对应的 mihomo 实例端口
+        const nodes = process.env.PROXY_LIST.split(',').filter(Boolean);
+        const workerIndex = parseInt(process.env.WORKER_INDEX || '0');
+        currentProxyUrl = nodes[workerIndex % nodes.length];
+        cachedAgent = createSocksAgent(currentProxyUrl);
+        console.log(`[Proxy] mihomo 实例: ${currentProxyUrl}`);
+
     } else if (config.proxy) {
-        // 模式3：静态代理
+        // 模式4：静态代理
         currentProxyUrl = config.proxy;
         cachedAgent = isSocksProxy(config.proxy) ? createSocksAgent(config.proxy) : new ProxyAgent(config.proxy);
         console.log(`[Proxy] 使用静态代理: ${config.proxy}`);
