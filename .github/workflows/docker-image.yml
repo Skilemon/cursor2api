@@ -46,9 +46,14 @@ jobs:
       - name: Download mihomo binaries
         run: |
           mkdir -p bin
-          MIHOMO_VERSION=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
-          curl -L "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-amd64-${MIHOMO_VERSION}.gz" | gunzip > bin/mihomo-amd64
+          MIHOMO_VERSION=$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+          echo "Downloading mihomo ${MIHOMO_VERSION}"
+          curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-amd64-${MIHOMO_VERSION}.gz" -o bin/mihomo-amd64.gz
+          file bin/mihomo-amd64.gz
+          gunzip bin/mihomo-amd64.gz
+          mv bin/mihomo-amd64 bin/mihomo-amd64 2>/dev/null || true
           chmod +x bin/mihomo-amd64
+          echo "mihomo downloaded: $(file bin/mihomo-amd64)"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
