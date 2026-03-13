@@ -23,6 +23,9 @@ const { version: VERSION } = require('../package.json') as { version: string };
 
 // ==================== 主进程 ====================
 
+// 强制使用轮询调度（修复 Windows 下 cluster 不均衡问题）
+cluster.schedulingPolicy = cluster.SCHED_RR;
+
 if (cluster.isPrimary) {
     const config = getConfig();
     const workerCount = parseInt(process.env.WORKERS || '') || config.workers || os.cpus().length;
