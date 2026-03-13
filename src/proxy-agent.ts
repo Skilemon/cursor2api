@@ -7,10 +7,12 @@
  * 3. 静态代理（PROXY）：固定IP
  */
 
-import { ProxyAgent } from 'undici';
+import { ProxyAgent, Agent, buildConnector } from 'undici';
+import { SocksClient } from 'socks';
+import type { SocksProxy } from 'socks';
 import { getConfig } from './config.js';
 
-let cachedAgent: ProxyAgent | undefined;
+let cachedAgent: ProxyAgent | Agent | undefined;
 let currentProxyUrl: string | undefined;
 let renewTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -74,6 +76,61 @@ async function fetchProxyFromPool(): Promise<string> {
     return json.data.proxy;
 }
 
+/**
+ * 解析 SOCKS 代理 URL，返回 SocksProxy 对象
+ * 支持格式: socks5://user:pass@host:port 或 socks5://host:port
+ */
+function parseSocksUrl(proxyUrl: string): SocksProxy {
+    const url = new URL(proxyUrl);
+    const type = url.protocol === 'socks4:' ? 4 : 5;
+    const proxy: SocksProxy = {
+        host: url.hostname,
+        port: parseInt(url.port),
+        type,
+    };
+    if (url.username) {
+        proxy.userId = decodeURIComponent(url.username);
+        proxy.password = decodeURIComponent(url.password);
+    }
+    return proxy;
+}
+
+/**
+ * 判断是否为 SOCKS 代理 URL
+ */
+function isSocksProxy(proxyUrl: string): boolean {
+    return proxyUrl.startsWith('socks5://') || proxyUrl.startsWith('socks4://');
+}
+
+/**
+ * 创建 SOCKS 代理 Agent（通过自定义 connector）
+ */
+function createSocksAgent(proxyUrl: string): Agent {
+    const socksProxy = parseSocksUrl(proxyUrl);
+    const tlsConnector = buildConnector({});
+
+    return new Agent({
+        connect(options, callback) {
+            const { hostname, port, protocol } = options as { hostname: string; port: string; protocol: string };
+            SocksClient.createConnection(
+                {
+                    proxy: socksProxy,
+                    command: 'connect',
+                    destination: { host: hostname, port: parseInt(port) },
+                },
+                (err, info) => {
+                    if (err || !info) return callback(err ?? new Error('SOCKS connection failed'), null);
+                    if (protocol === 'https:') {
+                        tlsConnector({ ...options, httpSocket: info.socket }, callback);
+                    } else {
+                        callback(null, info.socket as never);
+                    }
+                }
+            );
+        },
+    });
+}
+
 function stopRenewTimer(): void {
     if (renewTimer) {
         clearInterval(renewTimer);
@@ -108,7 +165,7 @@ export async function initProxy(force = false): Promise<void> {
         // 模式1：代理分配服务（保证不重复）
         const proxyUrl = await allocateFromService();
         currentProxyUrl = proxyUrl;
-        cachedAgent = new ProxyAgent(proxyUrl);
+        cachedAgent = isSocksProxy(proxyUrl) ? createSocksAgent(proxyUrl) : new ProxyAgent(proxyUrl);
         console.log(`[Proxy] 分配服务获取代理: ${proxyUrl}`);
 
         // 定时续约
@@ -120,13 +177,13 @@ export async function initProxy(force = false): Promise<void> {
         // 模式2：直接从代理池获取（不保证不重复）
         const proxyUrl = await fetchProxyFromPool();
         currentProxyUrl = proxyUrl;
-        cachedAgent = new ProxyAgent(proxyUrl);
+        cachedAgent = isSocksProxy(proxyUrl) ? createSocksAgent(proxyUrl) : new ProxyAgent(proxyUrl);
         console.log(`[Proxy] 代理池获取代理: ${proxyUrl}`);
 
     } else if (config.proxy) {
         // 模式3：静态代理
         currentProxyUrl = config.proxy;
-        cachedAgent = new ProxyAgent(config.proxy);
+        cachedAgent = isSocksProxy(config.proxy) ? createSocksAgent(config.proxy) : new ProxyAgent(config.proxy);
         console.log(`[Proxy] 使用静态代理: ${config.proxy}`);
 
     } else {
