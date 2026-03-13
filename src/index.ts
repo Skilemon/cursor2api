@@ -72,8 +72,17 @@ async function startWorker() {
 
     const config = getConfig();
 
-    // 初始化代理（从分配服务或静态配置）
-    await initProxy();
+    // 初始化代理（从分配服务或静态配置），失败重试最多5次
+    for (let i = 1; ; i++) {
+        try {
+            await initProxy();
+            break;
+        } catch (err) {
+            if (i >= 5) throw err;
+            console.warn(`[Worker ${process.pid}] initProxy 失败 (${i}/5)，3s 后重试...`, err);
+            await new Promise(r => setTimeout(r, 3000));
+        }
+    }
 
     const app = express();
     app.use(express.json({ limit: '50mb' }));
