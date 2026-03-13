@@ -81,7 +81,7 @@ async function sendCursorRequestInner(
     const headers = getChromeHeaders();
 
     const proxyInfo = getCurrentProxyUrl() ?? 'none';
-    console.log(`[Cursor] 发送请求: model=${req.model}, messages=${req.messages.length}, proxy=${proxyInfo}`);
+    console.log(`[Cursor] 发送请求: model=${req.model}, messages=${req.messages.length}, proxy=${proxyInfo}, time=${new Date().toISOString()}`);
 
     const config = getConfig();
     const controller = new AbortController();
