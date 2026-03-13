@@ -63,3 +63,6 @@ logs/
 dist/
 build/
 *.traineddata
+
+# mihomo binaries (download manually before docker build)
+bin/
