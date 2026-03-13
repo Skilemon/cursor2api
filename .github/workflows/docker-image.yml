@@ -43,6 +43,13 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=${{ github.event.inputs.version }},enable=${{ github.event.inputs.version != '' }}
 
+      - name: Download mihomo binaries
+        run: |
+          mkdir -p bin
+          MIHOMO_VERSION=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+          curl -L "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-amd64-${MIHOMO_VERSION}.gz" | gunzip > bin/mihomo-amd64
+          chmod +x bin/mihomo-amd64
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
