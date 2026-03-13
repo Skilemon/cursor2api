@@ -68,7 +68,7 @@ if (cluster.isPrimary) {
     // Worker 退出时自动重启，透传原 WORKER_INDEX 保持代理绑定关系
     cluster.on('exit', (worker, code, signal) => {
         console.error(`[Cluster] Worker ${worker.process.pid} 退出 (code=${code}, signal=${signal})，重启中...`);
-        const workerIndex = (worker.process as NodeJS.Process).env?.WORKER_INDEX ?? '0';
+        const workerIndex = (worker.process as unknown as NodeJS.Process).env?.WORKER_INDEX ?? '0';
         cluster.fork({ WORKER_INDEX: workerIndex });
     });
 
