@@ -10,6 +10,17 @@
 
 import { readFileSync, existsSync } from 'fs';
 
+// 文件内容缓存，避免同一文件多次同步读取阻塞事件循环
+const fileContentCache = new Map<string, string>();
+function readFileCached(filePath: string): string {
+    if (fileContentCache.has(filePath)) return fileContentCache.get(filePath)!;
+    const content = readFileSync(filePath, 'utf-8');
+    fileContentCache.set(filePath, content);
+    // TTL: 30s 后清除缓存，防止文件修改后读到旧内容
+    setTimeout(() => fileContentCache.delete(filePath), 30000);
+    return content;
+}
+
 const SMART_DOUBLE_QUOTES = new Set([
     '\u00ab', '\u201c', '\u201d', '\u275e',
     '\u201f', '\u201e', '\u275d', '\u00bb',
@@ -91,7 +102,7 @@ export function repairExactMatchToolArguments(
 
     try {
         if (!existsSync(filePath)) return args;
-        const content = readFileSync(filePath, 'utf-8');
+        const content = readFileCached(filePath);
 
         if (content.includes(oldString)) return args;
 

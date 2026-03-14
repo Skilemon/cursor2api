@@ -359,11 +359,23 @@ async function handleOpenAIStream(
     let retryCount = 0;
 
     // 统一缓冲模式：先缓冲全部响应，再检测拒绝和处理
+    const EARLY_REFUSAL_CHECK_THRESHOLD = 300;
+    let earlyAborted = false;
+
     const executeStream = async () => {
         fullResponse = '';
+        earlyAborted = false;
         await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
             if (event.type !== 'text-delta' || !event.delta) return;
             fullResponse += event.delta;
+            // 流中早期拒绝检测：累积够判断字符数后立即检测，确认拒绝则中止流
+            if (fullResponse.length >= EARLY_REFUSAL_CHECK_THRESHOLD && !earlyAborted) {
+                if (isRefusal(fullResponse) && !(hasTools && fullResponse.includes('```json'))) {
+                    earlyAborted = true;
+                    console.log(`[OpenAI] 早期拒绝检测: ${fullResponse.length} chars 后中止流`);
+                    return false;
+                }
+            }
         });
     };
 

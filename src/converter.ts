@@ -22,7 +22,7 @@ import type {
 import { getConfig } from './config.js';
 import { applyVisionInterceptor } from './vision.js';
 import { fixToolCallArguments } from './tool-fixer.js';
-import { THINKING_HINT } from './thinking.js';
+import { THINKING_HINT, THINKING_HINT_WITH_TOOLS } from './thinking.js';
 
 // ==================== 工具指令构建 ====================
 
@@ -343,7 +343,7 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
         if (lastMsg.role === 'user') {
             const lastPart = lastMsg.parts[lastMsg.parts.length - 1];
             if (lastPart && lastPart.type === 'text') {
-                lastPart.text = lastPart.text + THINKING_HINT;
+                lastPart.text = lastPart.text + (hasTools ? THINKING_HINT_WITH_TOOLS : THINKING_HINT);
             }
         }
     }

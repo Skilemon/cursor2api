@@ -87,3 +87,6 @@ export function extractThinking(text: string): ExtractThinkingResult {
  * 与 cursor2api-go 的 thinkingHint 保持一致
  */
 export const THINKING_HINT = `You may use <thinking>...</thinking> for brief private reasoning. HARD LIMITS: max 3 lines, max 120 words. Do NOT write code, full solutions, or long analysis inside thinking. Never repeat thinking content in the final response.`;
+
+// 有工具时放宽推理限制，复杂工具调用需要更多推理空间
+export const THINKING_HINT_WITH_TOOLS = `You may use <thinking>...</thinking> for private reasoning before tool calls. HARD LIMITS: max 8 lines, max 300 words. Use it to plan which tools to call and in what order. Do NOT write full code or long analysis inside thinking. Never repeat thinking content in the final response.`;
