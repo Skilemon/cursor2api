@@ -724,6 +724,16 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             console.log(`[Handler] ⚠️ ${MAX_AUTO_CONTINUE}次隐式续写后仍受限于截断 (${fullResponse.length} chars)，设置 stop_reason=max_tokens`);
         }
 
+        // ★ 工具模式下静默剥离 <thinking> 块，不触发重试
+        // 从源头（buildToolInstructions 注入 Do NOT use <thinking>）阻止，这里作为兜底
+        if (hasTools && /<thinking>/i.test(fullResponse)) {
+            const stripped = fullResponse.replace(/<thinking>[\s\S]*?<\/thinking>\s*/gi, '');
+            if (stripped !== fullResponse) {
+                console.log(`[Handler] 静默剥离 thinking 块: ${fullResponse.length} → ${stripped.length} chars`);
+                fullResponse = stripped;
+            }
+        }
+
         if (hasTools) {
             let { toolCalls, cleanText } = parseToolCalls(fullResponse);
 
@@ -1012,6 +1022,15 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
     let stopReason = (hasTools && isTruncated(fullText)) ? 'max_tokens' : 'end_turn';
     if (stopReason === 'max_tokens') {
         console.log(`[Handler] ⚠️ 非流式检测到截断响应 (${fullText.length} chars)，设置 stop_reason=max_tokens`);
+    }
+
+    // ★ 工具模式下静默剥离 <thinking> 块
+    if (hasTools && /<thinking>/i.test(fullText)) {
+        const stripped = fullText.replace(/<thinking>[\s\S]*?<\/thinking>\s*/gi, '');
+        if (stripped !== fullText) {
+            console.log(`[Handler] 非流式：静默剥离 thinking 块: ${fullText.length} → ${stripped.length} chars`);
+            fullText = stripped;
+        }
     }
 
     if (hasTools) {
