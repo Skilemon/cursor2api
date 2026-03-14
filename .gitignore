@@ -63,3 +63,7 @@ logs/
 dist/
 build/
 *.traineddata
+nul
+.claude/plugins.json
+bin/mihomo-amd64
+bin/mihomo-arm64
