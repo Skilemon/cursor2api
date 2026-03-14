@@ -66,3 +66,5 @@ build/
 
 # mihomo binaries (download manually before docker build)
 bin/
+cursor2api-2.6.0
+nul
