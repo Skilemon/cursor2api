@@ -47,7 +47,7 @@ function getChromeHeaders(): Record<string, string> {
  */
 export async function sendCursorRequest(
     req: CursorChatRequest,
-    onChunk: (event: CursorSSEEvent) => void,
+    onChunk: (event: CursorSSEEvent) => boolean | void,
 ): Promise<void> {
     const maxRetries = 5;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -56,6 +56,9 @@ export async function sendCursorRequest(
             return;
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
+            // 主动中止（早期拒绝检测）不是网络失败，直接返回让上层处理
+            if (err instanceof Error && err.name === 'AbortError') return;
+            if (msg.includes('This operation was aborted')) return;
             console.error(`[Cursor] 请求失败 (${attempt}/${maxRetries}): ${msg}`);
             // 4xx 错误（除 429）换代理也无法解决，直接抛出
             const httpMatch = msg.match(/HTTP (\d+)/);
@@ -76,7 +79,7 @@ export async function sendCursorRequest(
 
 async function sendCursorRequestInner(
     req: CursorChatRequest,
-    onChunk: (event: CursorSSEEvent) => void,
+    onChunk: (event: CursorSSEEvent) => boolean | void,
 ): Promise<void> {
     const headers = getChromeHeaders();
 
@@ -148,7 +151,11 @@ async function sendCursorRequestInner(
                 } else {
                     otherEvents.push(data);
                 }
-                onChunk(event);
+                const result = onChunk(event);
+                if (result === false) {
+                    // 回调返回 false 表示请求方希望提前中止（如检测到拒绝）
+                    controller.abort();
+                }
             } catch {
                 // 非 JSON 数据，原样记录
                 otherEvents.push(data);
