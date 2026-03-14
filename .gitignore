@@ -63,3 +63,11 @@ logs/
 dist/
 build/
 *.traineddata
+cursor2api2.5.3
+cursor2api-2.6.2
+bin/mihomo-arm64
+bin/mihomo-amd64
+.claude/settings.local.json
+.claude/plugins.json
+nul
+.claude/settings.local.json
