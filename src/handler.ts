@@ -24,6 +24,56 @@ function msgId(): string {
     return 'msg_' + uuidv4().replace(/-/g, '').substring(0, 24);
 }
 
+// ==================== response_format 支持 ====================
+
+/**
+ * 将 response_format 约束注入到最后一条用户消息末尾
+ * 引导模型直接输出合规 JSON，不加 markdown 包裹
+ */
+function injectResponseFormat(body: AnthropicRequest): void {
+    const fmt = body.response_format;
+    if (!fmt || fmt.type === 'text') return;
+
+    let hint = '';
+    if (fmt.type === 'json_object') {
+        hint = '\n\nIMPORTANT: Your entire response MUST be valid JSON only. No explanation, no markdown code fences, no extra text before or after the JSON object.';
+    } else if (fmt.type === 'json_schema') {
+        const schemaStr = JSON.stringify(fmt.json_schema.schema, null, 2);
+        hint = `\n\nIMPORTANT: Your entire response MUST be valid JSON that strictly matches this schema:\n${schemaStr}\nNo explanation, no markdown code fences, no extra text.`;
+    }
+    if (!hint) return;
+
+    // 找到最后一条 user 消息，追加提示
+    for (let i = body.messages.length - 1; i >= 0; i--) {
+        const msg = body.messages[i];
+        if (msg.role === 'user') {
+            if (typeof msg.content === 'string') {
+                msg.content = msg.content + hint;
+            } else if (Array.isArray(msg.content)) {
+                const lastText = [...msg.content].reverse().find(b => b.type === 'text');
+                if (lastText && lastText.text !== undefined) {
+                    lastText.text = lastText.text + hint;
+                } else {
+                    msg.content.push({ type: 'text', text: hint.trim() });
+                }
+            }
+            break;
+        }
+    }
+}
+
+/**
+ * 剥离模型用 markdown 代码块包裹的 JSON
+ * 仅当 response_format 为 json 模式时调用
+ * 支持: ```json ... ``` 和 ``` ... ```
+ */
+function stripJsonMarkdown(text: string): string {
+    const trimmed = text.trim();
+    const m = trimmed.match(/^```(?:json)?\s*([\s\S]*?)```\s*$/);
+    if (m) return m[1].trim();
+    return trimmed;
+}
+
 function toolId(): string {
     return 'toolu_' + uuidv4().replace(/-/g, '').substring(0, 24);
 }

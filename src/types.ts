@@ -1,5 +1,10 @@
 // ==================== Anthropic API Types ====================
 
+export type AnthropicResponseFormat =
+    | { type: 'text' }
+    | { type: 'json_object' }
+    | { type: 'json_schema'; json_schema: { name: string; strict?: boolean; schema: Record<string, unknown> } };
+
 export interface AnthropicRequest {
     model: string;
     messages: AnthropicMessage[];
@@ -11,6 +16,7 @@ export interface AnthropicRequest {
     temperature?: number;
     top_p?: number;
     stop_sequences?: string[];
+    response_format?: AnthropicResponseFormat;
 }
 
 /** tool_choice 控制模型是否必须调用工具

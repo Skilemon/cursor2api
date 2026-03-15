@@ -750,7 +750,7 @@ export function parseToolCalls(responseText: string): {
     const blocksToRemove: Array<{ start: number; end: number }> = [];
 
     // 查找所有 ```json (action)? 开头的位置
-    const openPattern = /```json(?:\s+action)?/g;
+    const openPattern = /```json(?:\s+action)?(?=\s|$)/g;
     let openMatch: RegExpExecArray | null;
 
     while ((openMatch = openPattern.exec(responseText)) !== null) {
