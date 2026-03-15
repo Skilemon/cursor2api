@@ -292,6 +292,9 @@ export function sanitizeResponse(text: string): string {
     let result = text;
 
     // === English identity replacements ===
+    result = result.replace(/Cursor\s+Agent/gi, 'Claude');
+    result = result.replace(/integrated\s+into\s+the\s+Cursor\s+(?:IDE\s+)?(?:support\s+)?experience/gi, 'built by Anthropic');
+    result = result.replace(/AI\s+assistant\s+integrated\s+into\s+(?:the\s+)?Cursor/gi, 'Claude, an AI assistant by Anthropic');
     result = result.replace(/I\s+am\s+(?:a\s+)?(?:support\s+)?assistant\s+for\s+Cursor/gi, 'I am Claude, an AI assistant by Anthropic');
     result = result.replace(/I(?:'m|\s+am)\s+(?:a\s+)?Cursor(?:'s)?\s+(?:support\s+)?assistant/gi, 'I am Claude, an AI assistant by Anthropic');
     result = result.replace(/Cursor(?:'s)?\s+support\s+assistant/gi, 'Claude, an AI assistant by Anthropic');
