@@ -39,7 +39,7 @@ export function extractThinking(text: string): ExtractThinkingResult {
     // ★ 预处理：清除模型有时在 thinking 标签周围包裹的反引号
     // 常见模式：`<thinking>...</thinking>` 或 ```<thinking>...</thinking>```
     text = text.replace(/`{1,3}\s*<thinking>/g, '<thinking>');
-    text = text.replace(/<\/thinking>\s*`{1,3}/g, '</thinking>');
+    text = text.replace(/<\/thinking>[ \t]*`{1,3}[ \t]*/g, '</thinking>');
 
     // 使用全局正则匹配所有 <thinking>...</thinking> 块
     // dotAll flag (s) 让 . 匹配换行符
@@ -82,12 +82,9 @@ export function extractThinking(text: string): ExtractThinkingResult {
     // 清理多余空行（thinking 块移除后可能留下连续空行）
     cleanText = cleanText.replace(/\n{3,}/g, '\n\n').trim();
 
-    // ★ 后处理：清除 thinking 提取后残留的孤立反引号
-    cleanText = cleanText.replace(/^`{1,3}\s*\n/, '').replace(/\n\s*`{1,3}$/, '');
-    // 处理 cleanText 整体被一对反引号包裹的情况
-    if (/^`[^`]/.test(cleanText) && /[^`]`$/.test(cleanText) && (cleanText.match(/`/g) || []).length === 2) {
-        cleanText = cleanText.substring(1, cleanText.length - 1);
-    }
+    // ★ 后处理：清除 thinking 提取后残留的孤立反引号行
+    // 只删除纯反引号行（```单独一行），不删除 ```json action 这类有内容的代码块开头
+    cleanText = cleanText.replace(/^`{1,3}[ \t]*\n/, '').replace(/\n`{1,3}[ \t]*$/, '');
     cleanText = cleanText.trim();
 
     if (thinkingBlocks.length > 0) {

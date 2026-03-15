@@ -462,8 +462,8 @@ export function isTruncated(text: string): boolean {
     if (/[,;:\[{(]\s*$/.test(trimmed)) return true;
     // 长响应以反斜杠 + n 结尾（JSON 字符串中间被截断）
     if (trimmed.length > 2000 && /\\n?\s*$/.test(trimmed) && !trimmed.endsWith('```')) return true;
-    // 短响应且以小写字母结尾（句子被截断的强烈信号）
-    if (trimmed.length < 500 && /[a-z]$/.test(trimmed)) return false; // 短响应不判断
+    // 工具模式下有未闭合的 json action 块时优先检测（已在上面处理）
+    // 短响应以小写字母结尾不额外判断（反而会误判正常短回复）
     return false;
 }
 
