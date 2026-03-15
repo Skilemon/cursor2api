@@ -27,7 +27,7 @@ import { THINKING_HINT, THINKING_HINT_WITH_TOOLS } from './thinking.js';
 // ==================== 系统提示词清洗 ====================
 
 /**
- * 系统提示词深度清洗（v2.6.5）
+ * 系统提示词深度清洗（v2.6.6）
  *
  * Tier 1 完全剥离：纯 AI 行为规则标签（连同内容整体删除）
  * Tier 2 去壳保留：项目上下文标签（仅删 XML 壳，保留有用内容）
@@ -221,7 +221,7 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
         let toolInstructions = buildToolInstructions(tools, hasCommunicationTool, toolChoice);
 
         // 系统提示词深度清洗后注入工具指令前
-        // v2.6.5 策略：Tier 1 完全剥离 AI 行为规则标签，Tier 2 去壳保留内容
+        // v2.6.6 策略：Tier 1 完全剥离 AI 行为规则标签，Tier 2 去壳保留内容
         if (combinedSystem) {
             combinedSystem = sanitizeSystemPrompt(combinedSystem);
         }
