@@ -68,3 +68,10 @@ build/
 bin/
 cursor2api-2.6.0
 nul
+2.3.3
+cursor2api-2.6.5
+src/converter.ts.backup
+.claude/settings.local.json
+.claude/plugins.json
+dist.zip
+.claude/settings.local.json
