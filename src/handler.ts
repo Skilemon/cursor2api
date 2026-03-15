@@ -292,7 +292,10 @@ export function sanitizeResponse(text: string): string {
     let result = text;
 
     // === English identity replacements ===
+    result = result.replace(/Cursor\s+(?:IDE\s+)?(?:中\s*)?AI\s+Agent/gi, 'Claude');
     result = result.replace(/Cursor\s+Agent/gi, 'Claude');
+    result = result.replace(/Cursor\s+IDE\s+中/gi, '');
+    result = result.replace(/适用于内联(?:代码)?注释和\s*README\s*生成/gi, '适用于各种任务');
     result = result.replace(/integrated\s+into\s+the\s+Cursor\s+(?:IDE\s+)?(?:support\s+)?experience/gi, 'built by Anthropic');
     result = result.replace(/AI\s+assistant\s+integrated\s+into\s+(?:the\s+)?Cursor/gi, 'Claude, an AI assistant by Anthropic');
     result = result.replace(/I\s+am\s+(?:a\s+)?(?:support\s+)?assistant\s+for\s+Cursor/gi, 'I am Claude, an AI assistant by Anthropic');
@@ -370,6 +373,38 @@ export function sanitizeResponse(text: string): string {
     return result;
 }
 
+async function handleMockTextStream(res: Response, body: AnthropicRequest, text: string): Promise<void> {
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+    });
+    const id = msgId();
+    const outputTokens = Math.ceil(text.length / 4);
+    writeSSE(res, 'message_start', { type: 'message_start', message: { id, type: 'message', role: 'assistant', content: [], model: body.model || 'claude-3-5-sonnet-20241022', stop_reason: null, stop_sequence: null, usage: { input_tokens: 15, output_tokens: 0 } } });
+    writeSSE(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+    writeSSE(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } });
+    writeSSE(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+    writeSSE(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: outputTokens } });
+    writeSSE(res, 'message_stop', { type: 'message_stop' });
+    res.end();
+}
+
+async function handleMockTextNonStream(res: Response, body: AnthropicRequest, text: string): Promise<void> {
+    const outputTokens = Math.ceil(text.length / 4);
+    res.json({
+        id: msgId(),
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text }],
+        model: body.model || 'claude-3-5-sonnet-20241022',
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+        usage: { input_tokens: 15, output_tokens: outputTokens }
+    });
+}
+
 async function handleMockIdentityStream(res: Response, body: AnthropicRequest): Promise<void> {
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
@@ -419,6 +454,18 @@ export async function handleMessages(req: Request, res: Response): Promise<void>
                 return await handleMockIdentityStream(res, body);
             } else {
                 return await handleMockIdentityNonStream(res, body);
+            }
+        }
+
+        // 无工具模式下的工具能力询问：直接返回 Claude 能力描述，不走 Cursor
+        // 原因：Cursor 文档 AI 会描述自己是 Cursor Agent/IDE 助手，暴露身份
+        const hasTools = (body.tools?.length ?? 0) > 0;
+        if (!hasTools && isToolCapabilityQuestion(body)) {
+            console.log(`[Handler] 拦截到工具能力询问（无工具模式），返回 Claude 能力描述`);
+            if (body.stream) {
+                return await handleMockTextStream(res, body, CLAUDE_TOOLS_RESPONSE);
+            } else {
+                return await handleMockTextNonStream(res, body, CLAUDE_TOOLS_RESPONSE);
             }
         }
 
