@@ -843,9 +843,11 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
                     break;
                 }
 
-                if (config.enableThinking && fullResponse.includes('<thinking>')) {
+                if (fullResponse.includes('<thinking>')) {
                     const extracted = extractThinking(fullResponse);
-                    thinkingBlocks = [...thinkingBlocks, ...extracted.thinkingBlocks];
+                    if (config.enableThinking) {
+                        thinkingBlocks = [...thinkingBlocks, ...extracted.thinkingBlocks];
+                    }
                     fullResponse = extracted.cleanText;
                 }
 
