@@ -161,4 +161,10 @@ async function startWorker() {
     app.listen(config.port, () => {
         console.log(`[Worker ${process.pid}] 已启动，监听 :${config.port}`);
     });
+
+    // 进程退出时优雅清理 OCR Worker（防止 WASM 子进程残留）
+    const { shutdownOcr } = await import('./vision.js');
+    const workerCleanup = async () => { await shutdownOcr(); process.exit(0); };
+    process.once('SIGTERM', workerCleanup);
+    process.once('SIGINT', workerCleanup);
 }

@@ -13,7 +13,23 @@
       "Bash(git -C \"D:\\\\青点樱\\\\cursor2api\" branch -a)",
       "Bash(npx tsc:*)",
       "Bash(python3:*)",
-      "Bash(xargs:*)"
+      "Bash(xargs:*)",
+      "Bash(git push:*)",
+      "Bash(git status:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(npm run build:*)",
+      "Bash(npm run dev:*)",
+      "Bash(PORT=3020 WORKERS=2 node:*)",
+      "Bash(kill:*)",
+      "Bash(Get-ChildItem:*)",
+      "Bash(echo.:*)",
+      "Bash(/tmp/test-regex-fix.mjs:*)",
+      "Bash(\"/c/Program Files/nodejs/node\" /tmp/t.mjs)",
+      "Bash(echo EXIT:$?)",
+      "Bash(PORT=3020 npx tsx:*)"
     ]
   }
 }

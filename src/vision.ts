@@ -2,10 +2,11 @@ import { getConfig } from './config.js';
 import type { AnthropicMessage, AnthropicContentBlock } from './types.js';
 import { getProxyFetchOptions } from './proxy-agent.js';
 import { createWorker } from 'tesseract.js';
+import type { Worker } from 'tesseract.js';
 import crypto from 'crypto';
 
 // Global cache for image parsing results
-// Key: SHA-256 hash of the image data string, Value: Extracted text
+// Key: sampled hash of the image data string, Value: Extracted text
 const imageParsingCache = new Map<string, string>();
 const MAX_CACHE_SIZE = 100;
 
@@ -20,9 +21,54 @@ function setCache(hash: string, text: string) {
     imageParsingCache.set(hash, text);
 }
 
+/**
+ * 采样哈希：只取头128+尾128+总长度，O(1) 而非 O(n)
+ * 仅用于缓存键，不用于安全校验
+ */
 function getImageHash(imageSource: string): string {
-    return crypto.createHash('sha256').update(imageSource).digest('hex');
+    const len = imageSource.length;
+    // 短字符串直接全量哈希（URL 等场景）
+    if (len <= 512) {
+        return crypto.createHash('sha256').update(imageSource).digest('hex');
+    }
+    const head = imageSource.slice(0, 128);
+    const tail = imageSource.slice(-128);
+    return crypto.createHash('sha256').update(`${len}:${head}:${tail}`).digest('hex');
 }
+
+// ==================== OCR Worker 单例池 ====================
+// 避免每次请求冷启动 Tesseract WASM（1~3s），改为进程级单例复用
+
+let _ocrWorker: Worker | null = null;
+let _ocrBusy = false;
+const _ocrQueue: Array<() => void> = [];
+
+async function acquireOcrWorker(): Promise<Worker> {
+    if (!_ocrWorker) {
+        _ocrWorker = await createWorker('eng+chi_sim');
+    }
+    if (_ocrBusy) {
+        await new Promise<void>(resolve => _ocrQueue.push(resolve));
+    }
+    _ocrBusy = true;
+    return _ocrWorker;
+}
+
+function releaseOcrWorker(): void {
+    _ocrBusy = false;
+    const next = _ocrQueue.shift();
+    if (next) next();
+}
+
+/** 进程退出时清理 OCR Worker */
+export async function shutdownOcr(): Promise<void> {
+    if (_ocrWorker) {
+        await _ocrWorker.terminate();
+        _ocrWorker = null;
+    }
+}
+
+// ==================== Vision 主入口 ====================
 
 export async function applyVisionInterceptor(messages: AnthropicMessage[]): Promise<void> {
     const config = getConfig();
@@ -74,14 +120,16 @@ export async function applyVisionInterceptor(messages: AnthropicMessage[]): Prom
     }
 }
 
-async function processWithLocalOCR(imageBlocks: AnthropicContentBlock[]): Promise<string> {
-    let combinedText = '';
-    const imagesToProcess: { index: number, source: string, hash: string }[] = [];
+// ==================== 本地 OCR ====================
 
-    // Check cache first
+async function processWithLocalOCR(imageBlocks: AnthropicContentBlock[]): Promise<string> {
+    const results: string[] = new Array(imageBlocks.length).fill('');
+    const imagesToProcess: { index: number; source: string; hash: string }[] = [];
+
+    // 检查缓存
     for (let i = 0; i < imageBlocks.length; i++) {
         const img = imageBlocks[i];
-        let imageSource: string = '';
+        let imageSource = '';
 
         if (img.type === 'image' && img.source?.data) {
             if (img.source.type === 'base64') {
@@ -94,9 +142,10 @@ async function processWithLocalOCR(imageBlocks: AnthropicContentBlock[]): Promis
 
         if (imageSource) {
             const hash = getImageHash(imageSource);
-            if (imageParsingCache.has(hash)) {
+            const cached = imageParsingCache.get(hash);
+            if (cached !== undefined) {
                 console.log(`[Vision] Image ${i + 1} found in cache, skipping OCR.`);
-                combinedText += `--- Image ${i + 1} OCR Text ---\n${imageParsingCache.get(hash)}\n\n`;
+                results[i] = `--- Image ${i + 1} OCR Text ---\n${cached}\n\n`;
             } else {
                 imagesToProcess.push({ index: i, source: imageSource, hash });
             }
@@ -104,28 +153,39 @@ async function processWithLocalOCR(imageBlocks: AnthropicContentBlock[]): Promis
     }
 
     if (imagesToProcess.length > 0) {
-        const worker = await createWorker('eng+chi_sim');
-
-        for (const { index, source, hash } of imagesToProcess) {
-            try {
-                const { data: { text } } = await worker.recognize(source);
-                const extractedText = text.trim() || '(No text detected in this image)';
-                setCache(hash, extractedText);
-                combinedText += `--- Image ${index + 1} OCR Text ---\n${extractedText}\n\n`;
-            } catch (err) {
-                console.error(`[Vision OCR] Failed to parse image ${index + 1}:`, err);
-                combinedText += `--- Image ${index + 1} ---\n(Failed to parse image with local OCR)\n\n`;
+        // 复用单例 Worker，不再每次冷启动
+        const worker = await acquireOcrWorker();
+        try {
+            for (const { index, source, hash } of imagesToProcess) {
+                try {
+                    const { data: { text } } = await worker.recognize(source);
+                    const extractedText = text.trim() || '(No text detected in this image)';
+                    setCache(hash, extractedText);
+                    results[index] = `--- Image ${index + 1} OCR Text ---\n${extractedText}\n\n`;
+                } catch (err) {
+                    console.error(`[Vision OCR] Failed to parse image ${index + 1}:`, err);
+                    results[index] = `--- Image ${index + 1} ---\n(Failed to parse image with local OCR)\n\n`;
+                }
             }
+        } finally {
+            releaseOcrWorker();
         }
-        await worker.terminate();
     }
 
-    return combinedText;
+    return results.join('');
 }
 
+// ==================== 外部 Vision API ====================
+
+/**
+ * 并行处理多张图片（最多3张并发），相比串行最多节省 N-1 倍延迟
+ */
 async function callVisionAPI(imageBlocks: AnthropicContentBlock[]): Promise<string> {
     const config = getConfig().vision!;
-    let combinedText = '';
+    const results: string[] = new Array(imageBlocks.length).fill('');
+
+    // 收集需要处理的图片（排除缓存命中）
+    const tasks: Array<() => Promise<void>> = [];
 
     for (let i = 0; i < imageBlocks.length; i++) {
         const img = imageBlocks[i];
@@ -146,40 +206,67 @@ async function callVisionAPI(imageBlocks: AnthropicContentBlock[]): Promise<stri
         const cached = imageParsingCache.get(hash);
         if (cached !== undefined) {
             console.log(`[Vision API] Image ${i + 1} cache hit.`);
-            combinedText += `--- Image ${i + 1} ---\n${cached}\n\n`;
+            results[i] = `--- Image ${i + 1} ---\n${cached}\n\n`;
             continue;
         }
 
-        const parts: any[] = [
-            { type: 'text', text: 'Please describe the attached image in detail. If it contains code, UI elements, or error messages, explicitly write them out.' },
-            { type: 'image_url', image_url: { url } }
-        ];
+        const idx = i;
+        const capturedUrl = url;
+        const capturedHash = hash;
+        tasks.push(async () => {
+            const parts: any[] = [
+                { type: 'text', text: 'Please describe the attached image in detail. If it contains code, UI elements, or error messages, explicitly write them out.' },
+                { type: 'image_url', image_url: { url: capturedUrl } }
+            ];
 
-        const payload = {
-            model: config.model,
-            messages: [{ role: 'user', content: parts }],
-            max_tokens: 1500
-        };
+            const payload = {
+                model: config.model,
+                messages: [{ role: 'user', content: parts }],
+                max_tokens: 1500
+            };
 
-        const res = await fetch(config.baseUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${config.apiKey}`
-            },
-            body: JSON.stringify(payload),
-            ...getProxyFetchOptions(),
-        } as any);
+            const res = await fetch(config.baseUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${config.apiKey}`
+                },
+                body: JSON.stringify(payload),
+                ...getProxyFetchOptions(),
+            } as any);
 
-        if (!res.ok) {
-            throw new Error(`Vision API returned status ${res.status}: ${await res.text()}`);
-        }
+            if (!res.ok) {
+                throw new Error(`Vision API returned status ${res.status}: ${await res.text()}`);
+            }
 
-        const data = await res.json() as any;
-        const result = data.choices?.[0]?.message?.content || 'No description returned.';
-        setCache(hash, result);
-        combinedText += `--- Image ${i + 1} ---\n${result}\n\n`;
+            const data = await res.json() as any;
+            const result = data.choices?.[0]?.message?.content || 'No description returned.';
+            setCache(capturedHash, result);
+            results[idx] = `--- Image ${idx + 1} ---\n${result}\n\n`;
+        });
     }
 
-    return combinedText;
+    // 并行执行，最多3张并发
+    if (tasks.length > 0) {
+        await runParallel(tasks, 3);
+    }
+
+    return results.join('');
+}
+
+/**
+ * 轻量并发控制，无需第三方依赖
+ * 保序（results 数组已按 index 写入），单个失败会抛出
+ */
+async function runParallel(tasks: Array<() => Promise<void>>, concurrency: number): Promise<void> {
+    const queue = [...tasks];
+    async function worker() {
+        while (queue.length > 0) {
+            const task = queue.shift()!;
+            await task();
+        }
+    }
+    await Promise.all(
+        Array.from({ length: Math.min(concurrency, tasks.length) }, worker)
+    );
 }

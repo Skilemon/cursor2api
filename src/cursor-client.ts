@@ -134,9 +134,10 @@ async function sendCursorRequestInner(
         }
 
         // 流式读取 SSE 响应
+        // 优化：游标偏移法，每次只扫描新增 chunk，避免 O(n²) 全量 split
         const reader = resp.body.getReader();
         const decoder = new TextDecoder();
-        let buffer = '';
+        let tail = '';          // 仅保留最后一个未完成行，不累积历史
         let eventCount = 0;
         let textDeltaCount = 0;
         const otherEvents: string[] = [];
@@ -162,6 +163,12 @@ async function sendCursorRequestInner(
             }
         };
 
+        const processLine = (line: string) => {
+            if (!line.startsWith('data: ')) return;
+            const data = line.slice(6).trim();
+            if (data) processEvent(data);
+        };
+
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -169,23 +176,24 @@ async function sendCursorRequestInner(
             // 每次收到数据就重置空闲计时器
             resetIdleTimer();
 
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
+            // 拼接当前 chunk，只向后扫描新换行符，旧内容不重复扫描
+            const chunk = decoder.decode(value, { stream: true });
+            const combined = tail + chunk;
+            const lastNl = combined.lastIndexOf('\n');
 
-            for (const line of lines) {
-                if (!line.startsWith('data: ')) continue;
-                const data = line.slice(6).trim();
-                if (!data) continue;
-                processEvent(data);
+            if (lastNl === -1) {
+                tail = combined;
+            } else {
+                const lines = combined.slice(0, lastNl).split('\n');
+                tail = combined.slice(lastNl + 1);
+                for (const line of lines) {
+                    processLine(line);
+                }
             }
         }
 
-        // 处理剩余 buffer
-        if (buffer.startsWith('data: ')) {
-            const data = buffer.slice(6).trim();
-            if (data) processEvent(data);
-        }
+        // 处理流结束时残留的不完整行
+        if (tail) processLine(tail);
 
         console.log(`[Cursor] 流读取完成: 共${eventCount}个事件, text-delta=${textDeltaCount}`);
         if (textDeltaCount === 0 && otherEvents.length > 0) {
