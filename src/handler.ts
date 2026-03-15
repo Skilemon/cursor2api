@@ -777,10 +777,16 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         }
 
         // thinking 提取
+        // 无论是否开启 thinking，只要模型输出了 <thinking> 块都需要提取
+        // 原因：converter.ts 注入了 THINKING_HINT_WITH_TOOLS，模型可能主动输出 <thinking>
+        // 若不提取，thinking 内容会干扰工具调用解析和截断检测
         let thinkingBlocks: Array<{ thinking: string }> = [];
-        if (config.enableThinking && fullResponse.includes('<thinking>')) {
+        if (fullResponse.includes('<thinking>')) {
             const extracted = extractThinking(fullResponse);
-            thinkingBlocks = extracted.thinkingBlocks;
+            // 只有开启 thinking 时才把 thinking blocks 发给客户端
+            if (config.enableThinking) {
+                thinkingBlocks = extracted.thinkingBlocks;
+            }
             fullResponse = extracted.cleanText;
         }
 
