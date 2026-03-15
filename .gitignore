@@ -76,3 +76,4 @@ src/converter.ts.backup
 dist.zip
 .claude/settings.local.json
 cursor2api-2.6.6
+cursor2api-2.6.7
