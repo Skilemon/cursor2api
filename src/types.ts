@@ -17,6 +17,7 @@ export interface AnthropicRequest {
     top_p?: number;
     stop_sequences?: string[];
     response_format?: AnthropicResponseFormat;
+    thinking?: { type: 'enabled' | 'disabled'; budget_tokens?: number };
 }
 
 /** tool_choice 控制模型是否必须调用工具

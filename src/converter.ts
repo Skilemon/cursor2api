@@ -913,3 +913,17 @@ async function preprocessImages(messages: AnthropicMessage[]): Promise<void> {
         // 失败时不阻塞请求，image block 会被 extractMessageText 的 case 'image' 兜底处理
     }
 }
+
+/**
+ * 判断 Write 工具调用的 content 是否被截断（用于触发一次针对性续写并合并）
+ * 从截断块恢复的 Write 常只有 file_path，或 content 很短/以转义结尾
+ */
+export function isWriteContentTruncated(tc: ParsedToolCall): boolean {
+    if ((tc.name !== 'Write' && tc.name !== 'write_file' && tc.name !== 'WriteFile') || !tc.arguments) return false;
+    const content = tc.arguments.content ?? tc.arguments.text;
+    if (content == null) return true;
+    if (typeof content !== 'string') return false;
+    if (content.length < 100) return true;
+    if (/\\s*$/.test(content)) return true;
+    return false;
+}
