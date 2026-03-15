@@ -76,6 +76,15 @@ const REFUSAL_PATTERNS = [
     /injected\s+into\s+another\s+AI/i,
     /emit\s+tool\s+invocations/i,
     /make\s+me\s+output\s+tool\s+calls/i,
+    // Documentation-only role lock (Cursor docs assistant)
+    /I\s+can\s+only\s+read\s+documentation/i,
+    /only\s+read\s+documentation\s+pages/i,
+    /don't\s+have\s+access\s+to\s+workspace/i,
+    /don't\s+have\s+access\s+to\s+(?:system\s+files|file\s+system|the\s+file)/i,
+    /workspace\s+file\s+actions/i,
+    /(?:only|just)\s+(?:have|provide)\s+(?:access\s+to\s+)?documentation/i,
+    /I\s+(?:only\s+)?(?:have\s+access\s+to|can\s+access)\s+(?:the\s+)?(?:Cursor\s+)?(?:docs|documentation)/i,
+    /available\s+tools\s+(?:only\s+)?(?:allow|let|enable)\s+(?:me\s+to\s+)?(?:read|access)\s+(?:docs|documentation)/i,
     // Tool availability claims (Cursor role lock)
     /I\s+(?:only\s+)?have\s+(?:access\s+to\s+)?(?:two|2|read_file|read_dir)\s+tool/i,
     /(?:only|just)\s+(?:two|2)\s+(?:tools?|functions?)\b/i,
