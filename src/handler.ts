@@ -457,11 +457,18 @@ export function isTruncatedToolOutput(text: string): boolean {
  * 截断症状：响应以句中断句结束，没有完整的句号/block 结束标志
  * 这是导致 Claude Code 频繁出现"继续"的根本原因
  */
+// Cursor 硬性输出截断阈值（由日志中 15000 chars 出现 27 次确认）
+const CURSOR_OUTPUT_LIMIT = 15000;
+
 export function isTruncated(text: string): boolean {
     if (!text || text.trim().length === 0) return false;
     const trimmed = text.trimEnd();
 
-    // ★ 核心检测：```json action 块是否未闭合（截断发生在工具调用参数中间）
+    // ★ 最可靠信号：响应长度恰好达到 Cursor 硬性输出上限（15000 chars）
+    // 日志统计确认：15000 chars 出现 27 次，远高于其他长度，是强截断信号
+    if (trimmed.length >= CURSOR_OUTPUT_LIMIT) return true;
+
+    // ★ 核心结构检测：```json action 块是否未闭合
     const jsonActionOpens = (trimmed.match(/```json\s+action/g) || []).length;
     if (jsonActionOpens > 0) {
         const jsonActionBlocks = trimmed.match(/```json\s+action[\s\S]*?```/g) || [];
@@ -469,21 +476,21 @@ export function isTruncated(text: string): boolean {
         return false;
     }
 
-    // 无工具调用时的通用截断检测（纯文本响应）
     // 代码块未闭合：只检测行首的代码块标记，避免 JSON 值中的反引号误判
     const lineStartCodeBlocks = (trimmed.match(/^```/gm) || []).length;
     if (lineStartCodeBlocks % 2 !== 0) return true;
 
-    // XML/HTML 标签未闭合 (Cursor 有时在中途截断)
+    // XML/HTML 标签未闭合
     const openTags = (trimmed.match(/^<[a-zA-Z]/gm) || []).length;
     const closeTags = (trimmed.match(/^<\/[a-zA-Z]/gm) || []).length;
     if (openTags > closeTags + 1) return true;
-    // 以逗号、分号、冒号、开括号结尾（明显未完成）
+
+    // 明显语法未完成：末尾是逗号、分号、冒号、开括号
     if (/[,;:\[{(]\s*$/.test(trimmed)) return true;
-    // 长响应以反斜杠 + n 结尾（JSON 字符串中间被截断）
+
+    // JSON 字符串中间被截断（长响应末尾是 \n）
     if (trimmed.length > 2000 && /\\n?\s*$/.test(trimmed) && !trimmed.endsWith('```')) return true;
-    // 短响应且以小写字母结尾（句子被截断的强烈信号）
-    if (trimmed.length < 500 && /[a-z]$/.test(trimmed)) return false; // 短响应不判断
+
     return false;
 }
 
@@ -686,6 +693,40 @@ async function handleStreamTrue(
         } else {
             fullResponse = CLAUDE_IDENTITY_RESPONSE;
         }
+    }
+
+    // ★ 截断恢复（无工具流式模式）
+    const MAX_STREAM_CONTINUE = 10;
+    let streamContinueCount = 0;
+    const originalMessages = [...activeCursorReq.messages];
+    while (isTruncated(fullResponse) && streamContinueCount < MAX_STREAM_CONTINUE) {
+        streamContinueCount++;
+        console.log(`[Handler] 真流式：检测到截断 (${fullResponse.length} chars)，续写第${streamContinueCount}次...`);
+        const anchorLength = Math.min(300, fullResponse.length);
+        const anchorText = fullResponse.slice(-anchorLength);
+        const continuationPrompt = `Your previous response was cut off mid-output. The last part of your output was:
+
+\`\`\`
+...${anchorText}
+\`\`\`
+
+Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
+        const continuationReq: CursorChatRequest = {
+            ...activeCursorReq,
+            messages: [
+                ...originalMessages,
+                { parts: [{ type: 'text', text: fullResponse }], id: uuidv4(), role: 'assistant' },
+                { parts: [{ type: 'text', text: continuationPrompt }], id: uuidv4(), role: 'user' },
+            ],
+        };
+        let continuation = '';
+        await sendCursorRequest(continuationReq, (event: CursorSSEEvent) => {
+            if (event.type !== 'text-delta' || !event.delta) return;
+            continuation += event.delta;
+        });
+        if (!continuation.trim()) break;
+        fullResponse = deduplicateContinuation(fullResponse, continuation);
+        console.log(`[Handler] 真流式：续写后总长 ${fullResponse.length} chars`);
     }
 
     // Phase 2: 流式推送
@@ -1254,7 +1295,7 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
     let splitAttempted = false;
     const originalMessages = [...activeCursorReq.messages];
 
-    while (hasTools && isTruncated(fullText) && continueCount < MAX_AUTO_CONTINUE) {
+    while (isTruncated(fullText) && continueCount < MAX_AUTO_CONTINUE) {
         continueCount++;
         const prevLength = fullText.length;
         const truncatedToolOutput = isTruncatedToolOutput(fullText);
