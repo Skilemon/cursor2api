@@ -38,6 +38,8 @@ import {
     CLAUDE_TOOLS_RESPONSE,
     MAX_REFUSAL_RETRIES,
     estimateInputTokens,
+    isTruncated,
+    deduplicateContinuation,
 } from './handler.js';
 
 function chatId(): string {
@@ -421,6 +423,39 @@ async function handleOpenAIStream(
             await executeStream();
         }
 
+        // ★ 截断恢复
+        const MAX_STREAM_CONTINUE = 10;
+        let streamContinueCount = 0;
+        const originalStreamMessages = [...activeCursorReq.messages];
+        while (isTruncated(fullResponse) && streamContinueCount < MAX_STREAM_CONTINUE) {
+            streamContinueCount++;
+            console.log(`[OpenAI] 流式：检测到截断 (${fullResponse.length} chars)，续写第${streamContinueCount}次...`);
+            const anchorText = fullResponse.slice(-300);
+            const continuationPrompt = `Your previous response was cut off mid-output. The last part of your output was:
+
+\`\`\`
+...${anchorText}
+\`\`\`
+
+Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
+            const continuationReq: CursorChatRequest = {
+                ...activeCursorReq,
+                messages: [
+                    ...originalStreamMessages,
+                    { parts: [{ type: 'text', text: fullResponse }], id: uuidv4(), role: 'assistant' },
+                    { parts: [{ type: 'text', text: continuationPrompt }], id: uuidv4(), role: 'user' },
+                ],
+            };
+            let continuation = '';
+            await sendCursorRequest(continuationReq, (event: CursorSSEEvent) => {
+                if (event.type !== 'text-delta' || !event.delta) return;
+                continuation += event.delta;
+            });
+            if (!continuation.trim()) break;
+            fullResponse = deduplicateContinuation(fullResponse, continuation);
+            console.log(`[OpenAI] 流式：续写后总长 ${fullResponse.length} chars`);
+        }
+
         let finishReason: 'stop' | 'tool_calls' = 'stop';
 
         // ★ Thinking 提取：OpenAI 流式模式下提取 <thinking> 块并作为 reasoning_content 发送
@@ -599,6 +634,36 @@ async function handleOpenAINonStream(
                 fullText = CLAUDE_IDENTITY_RESPONSE;
             }
         }
+    }
+
+    // ★ 截断恢复
+    const MAX_AUTO_CONTINUE = 10;
+    let continueCount = 0;
+    const originalMessages = [...cursorReq.messages];
+    let activeCursorReq = cursorReq;
+    while (isTruncated(fullText) && continueCount < MAX_AUTO_CONTINUE) {
+        continueCount++;
+        console.log(`[OpenAI] 非流式：检测到截断 (${fullText.length} chars)，续写第${continueCount}次...`);
+        const anchorText = fullText.slice(-300);
+        const continuationPrompt = `Your previous response was cut off mid-output. The last part of your output was:
+
+\`\`\`
+...${anchorText}
+\`\`\`
+
+Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
+        const continuationReq: CursorChatRequest = {
+            ...activeCursorReq,
+            messages: [
+                ...originalMessages,
+                { parts: [{ type: 'text', text: fullText }], id: uuidv4(), role: 'assistant' },
+                { parts: [{ type: 'text', text: continuationPrompt }], id: uuidv4(), role: 'user' },
+            ],
+        };
+        const continuation = await sendCursorRequestFull(continuationReq);
+        if (!continuation.trim()) break;
+        fullText = deduplicateContinuation(fullText, continuation);
+        console.log(`[OpenAI] 非流式：续写后总长 ${fullText.length} chars`);
     }
 
     let content: string | null = fullText;

@@ -505,7 +505,7 @@ export function isTruncated(text: string): boolean {
  * 
  * 算法：从续写内容的头部取不同长度的前缀，检查是否出现在原内容的尾部
  */
-function deduplicateContinuation(existing: string, continuation: string): string {
+export function deduplicateContinuation(existing: string, continuation: string): string {
     if (!continuation || !existing) return continuation;
 
     // 对比窗口：取原内容尾部和续写头部的最大重叠检测范围
