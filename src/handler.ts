@@ -1190,8 +1190,18 @@ async function handleStreamBuffered(
                 const deduped = deduplicateContinuation(fullResponse, continuation);
                 fullResponse += deduped;
 
-                // 续写部分也要解析并发送
-                const { toolCalls: contToolCalls, cleanText: contCleanText } = parseToolCalls(deduped);
+                // 续写部分也要解析并发送（先提取 thinking，避免裸 <thinking> 块泄漏给客户端）
+                let contText = deduped;
+                if (contText.includes('<thinking>')) {
+                    const contExtracted = extractThinking(contText);
+                    contText = contExtracted.cleanText;
+                    // 仅在客户端明确启用 thinking 且尚未发送过 thinking 块时才发送
+                    if (clientExplicitThinking && !thinkingSent) {
+                        const contThinking = contExtracted.thinkingBlocks.map(tb => tb.thinking).join('\n\n');
+                        if (contThinking) sendThinkingBlock(contThinking);
+                    }
+                }
+                const { toolCalls: contToolCalls, cleanText: contCleanText } = parseToolCalls(contText);
                 if (contCleanText.trim()) sendTextDelta(contCleanText);
                 for (const tc of contToolCalls) {
                     sendToolUseBlock(tc.name, tc.arguments);
