@@ -373,16 +373,33 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
         const fewShotOffset = hasTools ? 2 : 0;
         if (messages.length > KEEP_RECENT + fewShotOffset) {
             const compressEnd = messages.length - KEEP_RECENT;
+            // ★ 找到压缩区内第一条真实用户消息（原始任务描述），压缩时跳过以保留任务上下文
+            let firstUserMsgIdx = -1;
+            for (let j = fewShotOffset; j < compressEnd; j++) {
+                if (messages[j].role === 'user') { firstUserMsgIdx = j; break; }
+            }
             for (let i = fewShotOffset; i < compressEnd; i++) {
+                if (i === firstUserMsgIdx) continue; // 保护第一条任务消息不被截断
                 const msg = messages[i];
                 for (const part of msg.parts) {
                     if (!part.text || part.text.length <= EARLY_MSG_MAX_CHARS) continue;
                     const originalLen = part.text.length;
                     // 包含工具调用块的 assistant 消息：提取摘要，不做子串截断
                     if (msg.role === 'assistant' && /```json action/i.test(part.text)) {
-                        const toolNames = [...part.text.matchAll(/"tool"\s*:\s*"([^"]+)"/g)].map(m => m[1]);
-                        const summary = toolNames.length > 0
-                            ? `[Assistant used tools: ${toolNames.join(', ')}]`
+                        // 逐块提取工具名和 task_id（用于 TaskOutput 重试追踪）
+                        const toolBlocks = [...part.text.matchAll(/```json\s+action\s*([\s\S]*?)```/g)];
+                        const toolSummaries = toolBlocks.map(block => {
+                            const toolMatch = block[1].match(/"tool"\s*:\s*"([^"]+)"/);
+                            const taskIdMatch = block[1].match(/"task_id"\s*:\s*"([^"]+)"/);
+                            if (!toolMatch) return 'unknown';
+                            const toolName = toolMatch[1];
+                            if (toolName === 'TaskOutput' && taskIdMatch) {
+                                return `TaskOutput(${taskIdMatch[1]})`;
+                            }
+                            return toolName;
+                        });
+                        const summary = toolSummaries.length > 0
+                            ? `[Assistant used tools: ${toolSummaries.join(', ')}]`
                             : `[Assistant response truncated: ${originalLen} chars]`;
                         part.text = summary;
                     } else {
@@ -392,6 +409,106 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
                         part.text = head + `\n\n... [truncated ${originalLen - BRIEF_TEXT_LEN - Math.floor(BRIEF_TEXT_LEN / 2)} chars] ...\n\n` + tail;
                     }
                     console.log(`[Converter] 📦 压缩 msg[${i}] (${msg.role}): ${originalLen} → ${part.text.length} chars`);
+                }
+            }
+        }
+    }
+
+    // ★ 任务提醒注入：将原始任务消息内容注入到最后一条 user 消息中
+    // 防止压缩或大文件读取后 AI 丢失任务上下文，误以为任务未知而重复询问
+    // 无论是否开启压缩，只要消息足够多（任务被埋入深处），都注入提醒
+    {
+        // ★ Fix P1/P5: 与 S1 保持完全一致的 keepRecent 计算逻辑，消除两套系统参数漂移
+        const compressionCfg2 = config.compression ?? { enabled: true, level: 2 as const, keepRecent: 6 };
+        const levelParams2: Record<number, { keepRecent: number }> = {
+            1: { keepRecent: 10 },
+            2: { keepRecent: 6 },
+            3: { keepRecent: 4 },
+        };
+        const _level2 = ('level' in compressionCfg2 ? (compressionCfg2 as {level?: number}).level : 2) ?? 2;
+        const lp2 = levelParams2[_level2] ?? levelParams2[2];
+        const KEEP_RECENT2 = ('keepRecent' in compressionCfg2 ? (compressionCfg2 as {keepRecent?: number}).keepRecent : undefined) ?? lp2.keepRecent;
+        const fewShotOffset2 = hasTools ? 2 : 0;
+        // ★ Fix P3: 与 S1 一致的 guard，确保压缩区确实有内容才进入
+        if (messages.length > KEEP_RECENT2 + fewShotOffset2) {
+            const compressEnd2 = messages.length - KEEP_RECENT2;
+            // 找压缩区内第一条真实用户消息（原始任务描述）
+            // 注意：System 1 压缩已保护该消息不被截断，所以这里读到的是完整原文
+            let firstUserText = '';
+            let firstUserInCompressZone = false;
+            for (let j = fewShotOffset2; j < compressEnd2; j++) {
+                const candidate = messages[j];
+                if (candidate.role !== 'user' || !candidate.parts[0]?.text) continue;
+                let txt = candidate.parts[0].text;
+                // ① 剥离之前轮次注入的 [TASK REMINDER:] 后缀，防止嵌套
+                txt = txt.replace(/\n\n\[TASK REMINDER:[\s\S]*$/, '').trim();
+                // ② 剥离 continuation prompt 后缀（这类消息不是真实任务描述）
+                txt = txt.replace(/\n\nRespond with the appropriate workspace action\./g, '').trim();
+                // ③ 如果剥离后内容太短（< 10 chars），说明本身就是 continuation 或空消息，跳过
+                // 注意：合法中文任务可能只有几个字，阈值不宜过高
+                if (txt.length < 10) continue;
+                firstUserText = txt;
+                firstUserInCompressZone = true;
+                break;
+            }
+            // 若原始任务在压缩区，且最后一条 user 消息不含该内容，则注入提醒
+            if (firstUserInCompressZone && firstUserText.length > 0) {
+                const MAX_TASK_REMINDER = 800;
+                const taskSnippet = firstUserText.length > MAX_TASK_REMINDER
+                    ? firstUserText.substring(0, MAX_TASK_REMINDER) + '...'
+                    : firstUserText;
+                const reminder = `\n\n[TASK REMINDER: Your original task was — ${taskSnippet}]`;
+                for (let i = messages.length - 1; i >= 0; i--) {
+                    if (messages[i].role === 'user' && messages[i].parts[0]?.text) {
+                        // ★ Fix P4: 去重检查时先剥离旧 reminder，再比对 taskSnippet 是否已存在
+                        // 避免因 reminder 格式变化导致误判，也避免同一任务重复追加
+                        const existingText = messages[i].parts[0].text
+                            .replace(/\n\n\[TASK REMINDER:[\s\S]*$/, '');
+                        const alreadyInjected = messages[i].parts[0].text.includes('[TASK REMINDER:')
+                            && messages[i].parts[0].text.includes(taskSnippet.substring(0, 40));
+                        if (!alreadyInjected) {
+                            messages[i].parts[0].text = existingText + reminder;
+                            console.log(`[Converter] 📌 任务提醒注入：${taskSnippet.length} chars → msg[${i}]`);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // ★ TaskOutput 无限重试检测：扫描消息中的 TaskOutput task_id 频次
+    // 若同一 task_id 出现 ≥ 3 次，注入警告到最后一条 user 消息
+    {
+        const taskIdCounts = new Map<string, number>();
+        for (const msg of messages) {
+            if (msg.role !== 'assistant') continue;
+            for (const part of msg.parts) {
+                if (!part.text) continue;
+                // 压缩后格式: TaskOutput(task_id)
+                for (const m of part.text.matchAll(/TaskOutput\(([^)]+)\)/g)) {
+                    const id = m[1];
+                    taskIdCounts.set(id, (taskIdCounts.get(id) ?? 0) + 1);
+                }
+                // 未压缩的原始 JSON 格式
+                if (/```json\s+action/i.test(part.text)) {
+                    for (const m of part.text.matchAll(/"task_id"\s*:\s*"([^"]+)"/g)) {
+                        const id = m[1];
+                        taskIdCounts.set(id, (taskIdCounts.get(id) ?? 0) + 1);
+                    }
+                }
+            }
+        }
+        const stuckTasks = [...taskIdCounts.entries()].filter(([, count]) => count >= 3);
+        if (stuckTasks.length > 0) {
+            const warnings = stuckTasks.map(([id, count]) =>
+                `TaskOutput(${id}) retried ${count} times`).join(', ');
+            const warningText = `\n\n[SYSTEM WARNING: Infinite retry loop detected! ${warnings}. Do NOT call TaskOutput for this task again. Use TaskStop to cancel it, or read the output file directly via the Read tool.]`;
+            for (let i = messages.length - 1; i >= 0; i--) {
+                if (messages[i].role === 'user' && messages[i].parts[0]?.text) {
+                    messages[i].parts[0].text += warningText;
+                    console.warn(`[Converter] ⚠️ TaskOutput 无限重试检测：${warnings}，已注入警告`);
+                    break;
                 }
             }
         }

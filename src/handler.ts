@@ -446,7 +446,7 @@ export async function handleMessages(req: Request, res: Response): Promise<void>
         log.startPhase('convert', '格式转换');
         const cursorReq = await convertToCursorRequest(body);
         log.recordCursorRequest(cursorReq);
-        log.endPhase('convert');
+        log.endPhase();
 
         if (body.stream) {
             log.startPhase('send', '发送请求');
