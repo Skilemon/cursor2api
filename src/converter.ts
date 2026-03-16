@@ -410,8 +410,9 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
 }
 
 // 最大工具结果长度（超过则截断，防止上下文溢出）
-// ★ 15000 chars 平衡点：保留足够信息让模型理解结果，同时为输出留空间
-const MAX_TOOL_RESULT_LENGTH = 15000;
+// ★ 10000 chars：为 Cursor 输出留出 ~5000 chars 余量，避免工具结果挤满输出预算
+// 模型看到 truncated 提示后会自动用 offset 参数续读，不影响信息完整性
+const MAX_TOOL_RESULT_LENGTH = 10000;
 
 
 
