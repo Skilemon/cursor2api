@@ -103,6 +103,7 @@ async function startWorker() {
     const { initProxy } = await import('./proxy-agent.js');
     const { handleMessages, listModels, countTokens } = await import('./handler.js');
     const { handleOpenAIChatCompletions, handleOpenAIResponses } = await import('./openai-handler.js');
+    const { serveLogViewer, apiGetLogs, apiGetRequests, apiGetStats, apiGetPayload, apiLogsStream, serveLogViewerLogin } = await import('./log-viewer.js');
 
     const config = getConfig();
 
@@ -128,6 +129,49 @@ async function startWorker() {
         res.header('Access-Control-Allow-Headers', '*');
         if (_req.method === 'OPTIONS') {
             res.sendStatus(200);
+            return;
+        }
+        next();
+    });
+
+    // ★ 日志查看器鉴权中间件
+    const logViewerAuth = (req: import('express').Request, res: import('express').Response, next: import('express').NextFunction) => {
+        const tokens = config.authTokens;
+        if (!tokens || tokens.length === 0) return next();
+        const tokenFromQuery = req.query.token as string | undefined;
+        const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
+        const tokenFromHeader = authHeader ? String(authHeader).replace(/^Bearer\s+/i, '').trim() : undefined;
+        const token = tokenFromQuery || tokenFromHeader;
+        if (!token || !tokens.includes(token)) {
+            if (req.path === '/logs') return serveLogViewerLogin(req, res);
+            res.status(401).json({ error: { message: 'Unauthorized. Provide token via ?token=xxx or Authorization header.', type: 'auth_error' } });
+            return;
+        }
+        next();
+    };
+
+    // ★ 日志查看器路由（带鉴权）
+    app.get('/logs', logViewerAuth, serveLogViewer);
+    app.get('/api/logs', logViewerAuth, apiGetLogs);
+    app.get('/api/requests', logViewerAuth, apiGetRequests);
+    app.get('/api/stats', logViewerAuth, apiGetStats);
+    app.get('/api/payload/:requestId', logViewerAuth, apiGetPayload);
+    app.get('/api/logs/stream', logViewerAuth, apiLogsStream);
+
+    // ★ API 鉴权中间件
+    app.use((req, res, next) => {
+        if (req.method === 'GET' || req.path === '/health') return next();
+        const tokens = config.authTokens;
+        if (!tokens || tokens.length === 0) return next();
+        const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
+        if (!authHeader) {
+            res.status(401).json({ error: { message: 'Missing authentication token. Use Authorization: Bearer <token>', type: 'auth_error' } });
+            return;
+        }
+        const token = String(authHeader).replace(/^Bearer\s+/i, '').trim();
+        if (!tokens.includes(token)) {
+            console.log(`[Auth] 拒绝无效 token: ${token.substring(0, 8)}...`);
+            res.status(403).json({ error: { message: 'Invalid authentication token', type: 'auth_error' } });
             return;
         }
         next();

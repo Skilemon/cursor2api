@@ -29,6 +29,16 @@ timeout: 120
 # 每个实例启动时从该接口获取一个代理IP，请求失败时自动换新IP
 # proxy_pool_url: "http://localhost:5173/api/getSingleProxy?delay=500"
 
+# API 鉴权 Token（可选）
+# 设置后，调用 /v1/messages 等接口及访问 /logs 日志页需携带 token
+# 传入方式：Authorization: Bearer <token> 或 x-api-key: <token> 或 ?token=<token>
+# 单个 token
+# auth_token: "your_token_here"
+# 多个 token（任意一个均可通过验证）
+# auth_tokens:
+#   - "token1"
+#   - "token2"
+
 # Worker 进程数（多进程模式）
 # 默认使用 CPU 核心数，环境变量 WORKERS 优先级更高
 workers: 10
@@ -53,3 +63,4 @@ vision:
   # base_url: "https://openrouter.ai/api/v1/chat/completions"
   # api_key: "sk-or-v1-..."
   # model: "meta-llama/llama-3.2-11b-vision-instruct:free"
+  # proxy: "http://127.0.0.1:7890"  # 视觉 API 单独走代理（留空则跟随全局代理）

@@ -21,6 +21,7 @@ import { getConfig } from './config.js';
 import { extractThinking } from './thinking.js';
 import { StreamingThinkingParser } from './streaming-parser.js';
 import { StreamingToolParser } from './streaming-tool-parser.js';
+import { createRequestLogger } from './logger.js';
 
 function msgId(): string {
     return 'msg_' + uuidv4().replace(/-/g, '').substring(0, 24);
@@ -406,12 +407,34 @@ async function handleMockIdentityNonStream(res: Response, body: AnthropicRequest
 export async function handleMessages(req: Request, res: Response): Promise<void> {
     const body = req.body as AnthropicRequest;
 
-    console.log(`[Handler] 收到请求: model=${body.model}, messages=${body.messages?.length}, stream=${body.stream}, tools=${body.tools?.length ?? 0}, thinking=${JSON.stringify(body.thinking)}`);
+    const systemStr = typeof body.system === 'string' ? body.system
+        : Array.isArray(body.system) ? body.system.map((b: any) => b.text || '').join('') : '';
+    const log = createRequestLogger({
+        method: req.method,
+        path: req.path,
+        model: body.model,
+        stream: !!body.stream,
+        hasTools: (body.tools?.length ?? 0) > 0,
+        toolCount: body.tools?.length ?? 0,
+        messageCount: body.messages?.length ?? 0,
+        apiFormat: 'anthropic',
+        systemPromptLength: systemStr.length,
+    });
+    log.startPhase('receive', '接收请求');
+    log.recordOriginalRequest(body);
+    log.info('Handler', 'receive', '收到 Anthropic Messages 请求', {
+        model: body.model,
+        messageCount: body.messages?.length,
+        stream: body.stream,
+        toolCount: body.tools?.length ?? 0,
+        maxTokens: body.max_tokens,
+        hasSystem: !!body.system,
+        thinking: body.thinking?.type,
+    });
 
     try {
-        // 注意：图片预处理已移入 convertToCursorRequest → preprocessImages() 统一处理
         if (isIdentityProbe(body)) {
-            console.log(`[Handler] 拦截到身份探针，返回模拟响应以规避风控`);
+            log.intercepted('身份探针拦截 → 返回模拟响应');
             if (body.stream) {
                 return await handleMockIdentityStream(res, body);
             } else {
@@ -420,16 +443,24 @@ export async function handleMessages(req: Request, res: Response): Promise<void>
         }
 
         // 转换为 Cursor 请求
+        log.startPhase('convert', '格式转换');
         const cursorReq = await convertToCursorRequest(body);
+        log.recordCursorRequest(cursorReq);
+        log.endPhase('convert');
 
         if (body.stream) {
+            log.startPhase('send', '发送请求');
             await handleStream(res, cursorReq, body);
+            log.complete(0);
         } else {
+            log.startPhase('send', '发送请求');
             await handleNonStream(res, cursorReq, body);
+            log.complete(0);
         }
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         console.error(`[Handler] 请求处理失败:`, message);
+        log.fail(message);
         res.status(500).json({
             type: 'error',
             error: { type: 'api_error', message },

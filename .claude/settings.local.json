@@ -30,7 +30,14 @@
       "Bash(\"/c/Program Files/nodejs/node\" /tmp/t.mjs)",
       "Bash(echo EXIT:$?)",
       "Bash(PORT=3020 npx tsx:*)",
-      "Bash(./src/converter.ts << 'EOF'\n\n/**\n * 判断 Write 工具调用的 content 是否被截断（用于触发一次针对性续写并合并）\n * 从截断块恢复的 Write 常只有 file_path，或 content 很短/以转义结尾\n */\nexport function isWriteContentTruncated\\(tc: ParsedToolCall\\): boolean {\n    if \\(\\(tc.name !== 'Write' && tc.name !== 'write_file' && tc.name !== 'WriteFile'\\) || !tc.arguments\\) return false;\n    const content = tc.arguments.content ?? tc.arguments.text;\n    if \\(content == null\\) return true;\n    if \\(typeof content !== 'string'\\) return false;\n    if \\(content.length < 100\\) return true;\n    if \\(/\\\\\\\\\\\\s*$/.test\\(content\\)\\) return true;\n    return false;\n}\nEOF)"
+      "Bash(./src/converter.ts << 'EOF'\n\n/**\n * 判断 Write 工具调用的 content 是否被截断（用于触发一次针对性续写并合并）\n * 从截断块恢复的 Write 常只有 file_path，或 content 很短/以转义结尾\n */\nexport function isWriteContentTruncated\\(tc: ParsedToolCall\\): boolean {\n    if \\(\\(tc.name !== 'Write' && tc.name !== 'write_file' && tc.name !== 'WriteFile'\\) || !tc.arguments\\) return false;\n    const content = tc.arguments.content ?? tc.arguments.text;\n    if \\(content == null\\) return true;\n    if \\(typeof content !== 'string'\\) return false;\n    if \\(content.length < 100\\) return true;\n    if \\(/\\\\\\\\\\\\s*$/.test\\(content\\)\\) return true;\n    return false;\n}\nEOF)",
+      "Bash(for f:*)",
+      "Bash(do echo:*)",
+      "Read(//d/青点樱/cursor2api/cursor2api-2.7.1/src/**)",
+      "Bash(done)",
+      "Bash(grep -v '^[<>] *$')",
+      "Bash(grep -v '^[<>] *//')",
+      "Bash(grep -v '^[<>] *$\\\\|^[<>] *//')"
     ]
   }
 }

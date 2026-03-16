@@ -37,13 +37,30 @@ export function getConfig(): AppConfig {
             if (yaml.fingerprint) {
                 if (yaml.fingerprint.user_agent) config.fingerprint.userAgent = yaml.fingerprint.user_agent;
             }
+            if (yaml.auth_tokens) {
+                config.authTokens = Array.isArray(yaml.auth_tokens)
+                    ? yaml.auth_tokens
+                    : String(yaml.auth_tokens).split(',').map((t: string) => t.trim()).filter(Boolean);
+            }
+            if (yaml.auth_token) config.authTokens = [yaml.auth_token];
             if (yaml.vision) {
                 config.vision = {
-                    enabled: yaml.vision.enabled !== false, // default to true if vision section exists in some way
+                    enabled: yaml.vision.enabled !== false,
                     mode: yaml.vision.mode || 'ocr',
                     baseUrl: yaml.vision.base_url || 'https://api.openai.com/v1/chat/completions',
                     apiKey: yaml.vision.api_key || '',
                     model: yaml.vision.model || 'gpt-4o-mini',
+                    ...(yaml.vision.proxy ? { proxy: yaml.vision.proxy } : {}),
+                };
+            }
+            // ★ 历史压缩配置
+            if (yaml.compression !== undefined) {
+                const c = yaml.compression;
+                config.compression = {
+                    enabled: c.enabled !== false,
+                    level: [1, 2, 3].includes(c.level) ? c.level : 2,
+                    keepRecent: typeof c.keep_recent === 'number' ? c.keep_recent : 6,
+                    earlyMsgMaxChars: typeof c.early_msg_max_chars === 'number' ? c.early_msg_max_chars : 2000,
                 };
             }
         } catch (e) {
@@ -57,7 +74,21 @@ export function getConfig(): AppConfig {
     if (process.env.PROXY) config.proxy = process.env.PROXY;
     if (process.env.PROXY_POOL_URL) config.proxyPoolUrl = process.env.PROXY_POOL_URL;
     if (process.env.CURSOR_MODEL) config.cursorModel = process.env.CURSOR_MODEL;
+    if (process.env.AUTH_TOKEN) config.authTokens = process.env.AUTH_TOKEN.split(',').map(t => t.trim()).filter(Boolean);
+    if (process.env.AUTH_TOKENS) config.authTokens = process.env.AUTH_TOKENS.split(',').map(t => t.trim()).filter(Boolean);
     if (process.env.ENABLE_THINKING !== undefined) config.enableThinking = process.env.ENABLE_THINKING !== 'false';
+    // 压缩环境变量覆盖
+    if (process.env.COMPRESSION_ENABLED !== undefined) {
+        if (!config.compression) config.compression = { enabled: true, level: 2, keepRecent: 6, earlyMsgMaxChars: 2000 };
+        config.compression.enabled = process.env.COMPRESSION_ENABLED !== 'false' && process.env.COMPRESSION_ENABLED !== '0';
+    }
+    if (process.env.COMPRESSION_LEVEL !== undefined) {
+        const lvl = parseInt(process.env.COMPRESSION_LEVEL);
+        if ([1, 2, 3].includes(lvl)) {
+            if (!config.compression) config.compression = { enabled: true, level: 2, keepRecent: 6, earlyMsgMaxChars: 2000 };
+            config.compression.level = lvl as 1 | 2 | 3;
+        }
+    }
 
     // 从 base64 FP 环境变量解析指纹
     if (process.env.FP) {

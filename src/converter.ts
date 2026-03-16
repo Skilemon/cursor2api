@@ -357,21 +357,41 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
         }
     }
 
-    // ★ 渐进式历史压缩（替代之前全删的智能压缩）
-    // 策略：保留最近 KEEP_RECENT 条消息完整，仅压缩早期消息中的超长文本
-    // 这不会丢失消息结构（不删消息），只缩短单条消息的文本，兼顾上下文完整性和输出空间
-    const KEEP_RECENT = 6; // 保留最近6条消息不压缩
-    const EARLY_MSG_MAX_CHARS = 2000; // 早期消息的最大字符数
-    if (messages.length > KEEP_RECENT + 2) { // +2 for few-shot messages
-        const compressEnd = messages.length - KEEP_RECENT;
-        for (let i = 2; i < compressEnd; i++) { // 从 index 2 开始跳过 few-shot
-            const msg = messages[i];
-            for (const part of msg.parts) {
-                if (part.text && part.text.length > EARLY_MSG_MAX_CHARS) {
+    // ★ 渐进式历史压缩（智能压缩，不破坏结构）
+    // 可通过 config.yaml 的 compression 配置控制开关和级别
+    const compressionConfig = config.compression ?? { enabled: true, level: 2 as const, keepRecent: 6, earlyMsgMaxChars: 2000 };
+    if (compressionConfig.enabled) {
+        const levelParams: Record<number, { keepRecent: number; maxChars: number; briefTextLen: number }> = {
+            1: { keepRecent: 10, maxChars: 4000, briefTextLen: 800 },
+            2: { keepRecent: 6,  maxChars: 2000, briefTextLen: 500 },
+            3: { keepRecent: 4,  maxChars: 1000, briefTextLen: 200 },
+        };
+        const lp = levelParams[compressionConfig.level] || levelParams[2];
+        const KEEP_RECENT = compressionConfig.keepRecent ?? lp.keepRecent;
+        const EARLY_MSG_MAX_CHARS = compressionConfig.earlyMsgMaxChars ?? lp.maxChars;
+        const BRIEF_TEXT_LEN = lp.briefTextLen;
+        const fewShotOffset = hasTools ? 2 : 0;
+        if (messages.length > KEEP_RECENT + fewShotOffset) {
+            const compressEnd = messages.length - KEEP_RECENT;
+            for (let i = fewShotOffset; i < compressEnd; i++) {
+                const msg = messages[i];
+                for (const part of msg.parts) {
+                    if (!part.text || part.text.length <= EARLY_MSG_MAX_CHARS) continue;
                     const originalLen = part.text.length;
-                    part.text = part.text.substring(0, EARLY_MSG_MAX_CHARS) +
-                        `\n\n... [truncated ${originalLen - EARLY_MSG_MAX_CHARS} chars for context budget]`;
-                    console.log(`[Converter] 📦 压缩早期消息 msg[${i}] (${msg.role}): ${originalLen} → ${part.text.length} chars`);
+                    // 包含工具调用块的 assistant 消息：提取摘要，不做子串截断
+                    if (msg.role === 'assistant' && /```json action/i.test(part.text)) {
+                        const toolNames = [...part.text.matchAll(/"tool"\s*:\s*"([^"]+)"/g)].map(m => m[1]);
+                        const summary = toolNames.length > 0
+                            ? `[Assistant used tools: ${toolNames.join(', ')}]`
+                            : `[Assistant response truncated: ${originalLen} chars]`;
+                        part.text = summary;
+                    } else {
+                        // 普通文本：在自然边界截断，头尾保留
+                        const head = part.text.substring(0, BRIEF_TEXT_LEN);
+                        const tail = part.text.substring(part.text.length - Math.floor(BRIEF_TEXT_LEN / 2));
+                        part.text = head + `\n\n... [truncated ${originalLen - BRIEF_TEXT_LEN - Math.floor(BRIEF_TEXT_LEN / 2)} chars] ...\n\n` + tail;
+                    }
+                    console.log(`[Converter] 📦 压缩 msg[${i}] (${msg.role}): ${originalLen} → ${part.text.length} chars`);
                 }
             }
         }

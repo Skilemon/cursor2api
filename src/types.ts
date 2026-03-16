@@ -17,7 +17,7 @@ export interface AnthropicRequest {
     top_p?: number;
     stop_sequences?: string[];
     response_format?: AnthropicResponseFormat;
-    thinking?: { type: 'enabled' | 'disabled'; budget_tokens?: number };
+    thinking?: { type: 'enabled' | 'disabled' | 'adaptive'; budget_tokens?: number };
 }
 
 /** tool_choice 控制模型是否必须调用工具
@@ -129,8 +129,16 @@ export interface AppConfig {
         baseUrl: string;
         apiKey: string;
         model: string;
+        proxy?: string;
     };
     fingerprint: {
         userAgent: string;
+    };
+    authTokens?: string[];
+    compression?: {
+        enabled: boolean;
+        level: 1 | 2 | 3;
+        keepRecent: number;
+        earlyMsgMaxChars: number;
     };
 }
