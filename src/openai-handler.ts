@@ -27,19 +27,21 @@ import type {
 import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converter.js';
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
 import { getConfig } from './config.js';
-import { extractThinking } from './thinking.js';
+import { createRequestLogger } from './logger.js';
+import { createIncrementalTextStreamer, splitLeadingThinkingBlocks, stripThinkingTags } from './streaming-text.js';
 import {
+    autoContinueCursorToolResponseFull,
+    autoContinueCursorToolResponseStream,
     isRefusal,
     sanitizeResponse,
     isIdentityProbe,
     isToolCapabilityQuestion,
     buildRetryRequest,
+    extractThinking,
     CLAUDE_IDENTITY_RESPONSE,
     CLAUDE_TOOLS_RESPONSE,
     MAX_REFUSAL_RETRIES,
     estimateInputTokens,
-    isTruncated,
-    deduplicateContinuation,
 } from './handler.js';
 
 function chatId(): string {
@@ -48,6 +50,43 @@ function chatId(): string {
 
 function toolCallId(): string {
     return 'call_' + uuidv4().replace(/-/g, '').substring(0, 24);
+}
+
+class OpenAIRequestError extends Error {
+    status: number;
+    type: string;
+    code: string;
+
+    constructor(message: string, status = 400, type = 'invalid_request_error', code = 'invalid_request') {
+        super(message);
+        this.name = 'OpenAIRequestError';
+        this.status = status;
+        this.type = type;
+        this.code = code;
+    }
+}
+
+function stringifyUnknownContent(value: unknown): string {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+        return String(value);
+    }
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return String(value);
+    }
+}
+
+function unsupportedImageFileError(fileId?: string): OpenAIRequestError {
+    const suffix = fileId ? ` (file_id: ${fileId})` : '';
+    return new OpenAIRequestError(
+        `Unsupported content part: image_file${suffix}. This proxy does not support OpenAI Files API image references. Please send the image as image_url, input_image, data URI, or a local file path instead.`,
+        400,
+        'invalid_request_error',
+        'unsupported_content_part'
+    );
 }
 
 // ==================== 请求转换：OpenAI → Anthropic ====================
@@ -59,6 +98,15 @@ function toolCallId(): string {
 function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
     const rawMessages: AnthropicMessage[] = [];
     let systemPrompt: string | undefined;
+
+    // ★ response_format 处理：构建温和的 JSON 格式提示（稍后追加到最后一条用户消息）
+    let jsonFormatSuffix = '';
+    if (body.response_format && body.response_format.type !== 'text') {
+        jsonFormatSuffix = '\n\nRespond in plain JSON format without markdown wrapping.';
+        if (body.response_format.type === 'json_schema' && body.response_format.json_schema?.schema) {
+            jsonFormatSuffix += ` Schema: ${JSON.stringify(body.response_format.json_schema.schema)}`;
+        }
+    }
 
     for (const msg of body.messages) {
         switch (msg.role) {
@@ -127,6 +175,26 @@ function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
     // 合并连续同角色消息（Anthropic API 要求 user/assistant 严格交替）
     const messages = mergeConsecutiveRoles(rawMessages);
 
+    // ★ response_format: 追加 JSON 格式提示到最后一条 user 消息
+    if (jsonFormatSuffix) {
+        for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i].role === 'user') {
+                const content = messages[i].content;
+                if (typeof content === 'string') {
+                    messages[i].content = content + jsonFormatSuffix;
+                } else if (Array.isArray(content)) {
+                    const lastTextBlock = [...content].reverse().find(b => b.type === 'text');
+                    if (lastTextBlock && lastTextBlock.text) {
+                        lastTextBlock.text += jsonFormatSuffix;
+                    } else {
+                        content.push({ type: 'text', text: jsonFormatSuffix.trim() });
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     // 转换工具定义：支持 OpenAI 标准格式和 Cursor 扁平格式
     const tools: AnthropicTool[] | undefined = body.tools?.map((t: OpenAITool | Record<string, unknown>) => {
         // Cursor IDE 可能发送扁平格式：{ name, description, input_schema }
@@ -159,6 +227,19 @@ function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
         stop_sequences: body.stop
             ? (Array.isArray(body.stop) ? body.stop : [body.stop])
             : undefined,
+        // ★ Thinking 开关：config.yaml 优先级最高
+        // enabled=true: 强制注入 thinking（即使客户端没请求）
+        // enabled=false: 强制关闭 thinking
+        // 未配置: 跟随客户端（模型名含 'thinking' 或传了 reasoning_effort 才注入）
+        ...(() => {
+            const tc = getConfig().thinking;
+            if (tc && tc.enabled) return { thinking: { type: 'enabled' as const } };
+            if (tc && !tc.enabled) return {};
+            // 未配置 → 跟随客户端信号
+            const modelHint = body.model?.toLowerCase().includes('thinking');
+            const effortHint = !!(body as unknown as Record<string, unknown>).reasoning_effort;
+            return (modelHint || effortHint) ? { thinking: { type: 'enabled' as const } } : {};
+        })(),
     };
 }
 
@@ -195,6 +276,11 @@ function toBlocks(content: string | AnthropicContentBlock[]): AnthropicContentBl
 
 /**
  * 从 OpenAI 消息中提取文本或多模态内容块
+ * 处理多种客户端格式：
+ *   - 文本块: { type: 'text'|'input_text', text: '...' }
+ *   - OpenAI 标准: { type: 'image_url', image_url: { url: '...' } }
+ *   - Anthropic 透传: { type: 'image', source: { type: 'url', url: '...' } }
+ *   - 部分客户端: { type: 'input_image', image_url: { url: '...' } }
  */
 function extractOpenAIContentBlocks(msg: OpenAIMessage): string | AnthropicContentBlock[] {
     if (msg.content === null || msg.content === undefined) return '';
@@ -202,10 +288,74 @@ function extractOpenAIContentBlocks(msg: OpenAIMessage): string | AnthropicConte
     if (Array.isArray(msg.content)) {
         const blocks: AnthropicContentBlock[] = [];
         for (const p of msg.content as (OpenAIContentPart | Record<string, unknown>)[]) {
-            if (p.type === 'text' && (p as OpenAIContentPart).text) {
+            if ((p.type === 'text' || p.type === 'input_text') && (p as OpenAIContentPart).text) {
                 blocks.push({ type: 'text', text: (p as OpenAIContentPart).text! });
             } else if (p.type === 'image_url' && (p as OpenAIContentPart).image_url?.url) {
                 const url = (p as OpenAIContentPart).image_url!.url;
+                if (url.startsWith('data:')) {
+                    const match = url.match(/^data:([^;]+);base64,(.+)$/);
+                    if (match) {
+                        blocks.push({
+                            type: 'image',
+                            source: { type: 'base64', media_type: match[1], data: match[2] }
+                        });
+                    }
+                } else {
+                    // HTTP(S)/local URL — 统一存储到 source.data，由 preprocessImages() 下载/读取
+                    blocks.push({
+                        type: 'image',
+                        source: { type: 'url', media_type: 'image/jpeg', data: url }
+                    });
+                }
+            } else if (p.type === 'image' && (p as any).source) {
+                // ★ Anthropic 格式透传：某些客户端混合发送 OpenAI 和 Anthropic 格式
+                const source = (p as any).source;
+                const imageUrl = source.url || source.data;
+                if (source.type === 'base64' && source.data) {
+                    blocks.push({
+                        type: 'image',
+                        source: { type: 'base64', media_type: source.media_type || 'image/jpeg', data: source.data }
+                    });
+                } else if (imageUrl) {
+                    if (imageUrl.startsWith('data:')) {
+                        const match = imageUrl.match(/^data:([^;]+);base64,(.+)$/);
+                        if (match) {
+                            blocks.push({
+                                type: 'image',
+                                source: { type: 'base64', media_type: match[1], data: match[2] }
+                            });
+                        }
+                    } else {
+                        blocks.push({
+                            type: 'image',
+                            source: { type: 'url', media_type: source.media_type || 'image/jpeg', data: imageUrl }
+                        });
+                    }
+                }
+            } else if (p.type === 'input_image' && (p as any).image_url?.url) {
+                // ★ input_image 类型：部分新版 API 客户端使用
+                const url = (p as any).image_url.url;
+                if (url.startsWith('data:')) {
+                    const match = url.match(/^data:([^;]+);base64,(.+)$/);
+                    if (match) {
+                        blocks.push({
+                            type: 'image',
+                            source: { type: 'base64', media_type: match[1], data: match[2] }
+                        });
+                    }
+                } else {
+                    blocks.push({
+                        type: 'image',
+                        source: { type: 'url', media_type: 'image/jpeg', data: url }
+                    });
+                }
+            } else if (p.type === 'image_file' && (p as any).image_file) {
+                const fileId = (p as any).image_file.file_id as string | undefined;
+                console.log(`[OpenAI] ⚠️ 收到不支持的 image_file 格式 (file_id: ${fileId || 'unknown'})`);
+                throw unsupportedImageFileError(fileId);
+            } else if ((p.type === 'image_url' || p.type === 'input_image') && (p as any).url) {
+                // ★ 扁平 URL 格式：某些客户端将 url 直接放在顶层而非 image_url.url
+                const url = (p as any).url as string;
                 if (url.startsWith('data:')) {
                     const match = url.match(/^data:([^;]+);base64,(.+)$/);
                     if (match) {
@@ -226,11 +376,37 @@ function extractOpenAIContentBlocks(msg: OpenAIMessage): string | AnthropicConte
             } else if (p.type === 'tool_result') {
                 // Anthropic 风格 tool_result 块直接透传
                 blocks.push(p as unknown as AnthropicContentBlock);
+            } else {
+                // ★ 通用兜底：检查未知类型的块是否包含可识别的图片数据
+                const anyP = p as Record<string, unknown>;
+                const possibleUrl = (anyP.url || anyP.file_path || anyP.path ||
+                    (anyP.image_url as any)?.url || anyP.data) as string | undefined;
+                if (possibleUrl && typeof possibleUrl === 'string') {
+                    const looksLikeImage = /\.(jpg|jpeg|png|gif|webp|bmp|svg)/i.test(possibleUrl) ||
+                        possibleUrl.startsWith('data:image/');
+                    if (looksLikeImage) {
+                        console.log(`[OpenAI] 🔄 未知内容类型 "${p.type}" 中检测到图片引用 → 转为 image block`);
+                        if (possibleUrl.startsWith('data:')) {
+                            const match = possibleUrl.match(/^data:([^;]+);base64,(.+)$/);
+                            if (match) {
+                                blocks.push({
+                                    type: 'image',
+                                    source: { type: 'base64', media_type: match[1], data: match[2] }
+                                });
+                            }
+                        } else {
+                            blocks.push({
+                                type: 'image',
+                                source: { type: 'url', media_type: 'image/jpeg', data: possibleUrl }
+                            });
+                        }
+                    }
+                }
             }
         }
         return blocks.length > 0 ? blocks : '';
     }
-    return String(msg.content);
+    return stringifyUnknownContent(msg.content);
 }
 
 /**
@@ -247,17 +423,61 @@ function extractOpenAIContent(msg: OpenAIMessage): string {
 export async function handleOpenAIChatCompletions(req: Request, res: Response): Promise<void> {
     const body = req.body as OpenAIChatRequest;
 
-    console.log(`[OpenAI] 收到请求: model=${body.model}, messages=${body.messages?.length}, stream=${body.stream}, tools=${body.tools?.length ?? 0}`);
+    const log = createRequestLogger({
+        method: req.method,
+        path: req.path,
+        model: body.model,
+        stream: !!body.stream,
+        hasTools: (body.tools?.length ?? 0) > 0,
+        toolCount: body.tools?.length ?? 0,
+        messageCount: body.messages?.length ?? 0,
+        apiFormat: 'openai',
+    });
+
+    log.startPhase('receive', '接收请求');
+    log.recordOriginalRequest(body);
+    log.info('OpenAI', 'receive', `收到 OpenAI Chat 请求`, {
+        model: body.model,
+        messageCount: body.messages?.length,
+        stream: body.stream,
+        toolCount: body.tools?.length ?? 0,
+    });
+
+    // ★ 图片诊断日志：记录每条消息中的 content 格式，帮助定位客户端发送格式
+    if (body.messages) {
+        for (let i = 0; i < body.messages.length; i++) {
+            const msg = body.messages[i];
+            if (typeof msg.content === 'string') {
+                // 检查字符串中是否包含图片路径特征
+                if (/\.(jpg|jpeg|png|gif|webp|bmp|svg)/i.test(msg.content)) {
+                    console.log(`[OpenAI] 📋 消息[${i}] role=${msg.role} content=字符串(${msg.content.length}chars) ⚠️ 包含图片后缀: ${msg.content.substring(0, 200)}`);
+                }
+            } else if (Array.isArray(msg.content)) {
+                const types = (msg.content as any[]).map(p => {
+                    if (p.type === 'image_url') return `image_url(${(p.image_url?.url || p.url || '?').substring(0, 60)})`;
+                    if (p.type === 'image') return `image(${p.source?.type || '?'})`;
+                    if (p.type === 'input_image') return `input_image`;
+                    if (p.type === 'image_file') return `image_file`;
+                    return p.type;
+                });
+                if (types.some(t => t !== 'text')) {
+                    console.log(`[OpenAI] 📋 消息[${i}] role=${msg.role} blocks: [${types.join(', ')}]`);
+                }
+            }
+        }
+    }
 
     try {
         // Step 1: OpenAI → Anthropic 格式
+        log.startPhase('convert', '格式转换 (OpenAI→Anthropic)');
         const anthropicReq = convertToAnthropicRequest(body);
+        log.endPhase();
 
         // 注意：图片预处理已移入 convertToCursorRequest → preprocessImages() 统一处理
 
         // Step 1.6: 身份探针拦截（复用 Anthropic handler 的逻辑）
         if (isIdentityProbe(anthropicReq)) {
-            console.log(`[OpenAI] 拦截到身份探针，返回模拟响应`);
+            log.intercepted('身份探针拦截 (OpenAI)');
             const mockText = "I am Claude, an advanced AI programming assistant created by Anthropic. I am ready to help you write code, debug, and answer your technical questions. Please let me know what we should work on!";
             if (body.stream) {
                 return handleOpenAIMockStream(res, body, mockText);
@@ -276,12 +496,15 @@ export async function handleOpenAIChatCompletions(req: Request, res: Response): 
         }
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
-        console.error(`[OpenAI] 请求处理失败:`, message);
-        res.status(500).json({
+        log.fail(message);
+        const status = err instanceof OpenAIRequestError ? err.status : 500;
+        const type = err instanceof OpenAIRequestError ? err.type : 'server_error';
+        const code = err instanceof OpenAIRequestError ? err.code : 'internal_error';
+        res.status(status).json({
             error: {
                 message,
-                type: 'server_error',
-                code: 'internal_error',
+                type,
+                code,
             },
         });
     }
@@ -325,6 +548,187 @@ function handleOpenAIMockNonStream(res: Response, body: OpenAIChatRequest, mockT
     });
 }
 
+function writeOpenAITextDelta(
+    res: Response,
+    id: string,
+    created: number,
+    model: string,
+    text: string,
+): void {
+    if (!text) return;
+    writeOpenAISSE(res, {
+        id,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{
+            index: 0,
+            delta: { content: text },
+            finish_reason: null,
+        }],
+    });
+}
+
+function writeOpenAIReasoningDelta(
+    res: Response,
+    id: string,
+    created: number,
+    model: string,
+    reasoningContent: string,
+): void {
+    if (!reasoningContent) return;
+    writeOpenAISSE(res, {
+        id,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{
+            index: 0,
+            delta: { reasoning_content: reasoningContent } as Record<string, unknown>,
+            finish_reason: null,
+        }],
+    });
+}
+
+async function handleOpenAIIncrementalTextStream(
+    res: Response,
+    cursorReq: CursorChatRequest,
+    body: OpenAIChatRequest,
+    anthropicReq: AnthropicRequest,
+    streamMeta: { id: string; created: number; model: string },
+): Promise<void> {
+    let activeCursorReq = cursorReq;
+    let retryCount = 0;
+    const thinkingEnabled = anthropicReq.thinking?.type === 'enabled';
+    let finalRawResponse = '';
+    let finalVisibleText = '';
+    let finalReasoningContent = '';
+    let streamer = createIncrementalTextStreamer({
+        transform: sanitizeResponse,
+        isBlockedPrefix: (text) => isRefusal(text.substring(0, 300)),
+    });
+    let reasoningSent = false;
+
+    const executeAttempt = async (): Promise<{
+        rawResponse: string;
+        visibleText: string;
+        reasoningContent: string;
+        streamer: ReturnType<typeof createIncrementalTextStreamer>;
+    }> => {
+        let rawResponse = '';
+        let visibleText = '';
+        let leadingBuffer = '';
+        let leadingResolved = false;
+        let reasoningContent = '';
+        const attemptStreamer = createIncrementalTextStreamer({
+            transform: sanitizeResponse,
+            isBlockedPrefix: (text) => isRefusal(text.substring(0, 300)),
+        });
+
+        const flushVisible = (chunk: string): void => {
+            if (!chunk) return;
+            visibleText += chunk;
+            const delta = attemptStreamer.push(chunk);
+            if (!delta) return;
+
+            if (thinkingEnabled && reasoningContent && !reasoningSent) {
+                writeOpenAIReasoningDelta(res, streamMeta.id, streamMeta.created, streamMeta.model, reasoningContent);
+                reasoningSent = true;
+            }
+            writeOpenAITextDelta(res, streamMeta.id, streamMeta.created, streamMeta.model, delta);
+        };
+
+        await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
+            if (event.type !== 'text-delta' || !event.delta) return;
+
+            rawResponse += event.delta;
+
+            if (!leadingResolved) {
+                leadingBuffer += event.delta;
+                const split = splitLeadingThinkingBlocks(leadingBuffer);
+
+                if (split.startedWithThinking) {
+                    if (!split.complete) return;
+                    reasoningContent = split.thinkingContent;
+                    leadingResolved = true;
+                    leadingBuffer = '';
+                    flushVisible(split.remainder);
+                    return;
+                }
+
+                leadingResolved = true;
+                const buffered = leadingBuffer;
+                leadingBuffer = '';
+                flushVisible(buffered);
+                return;
+            }
+
+            flushVisible(event.delta);
+        });
+
+        return {
+            rawResponse,
+            visibleText,
+            reasoningContent,
+            streamer: attemptStreamer,
+        };
+    };
+
+    while (true) {
+        const attempt = await executeAttempt();
+        finalRawResponse = attempt.rawResponse;
+        finalVisibleText = attempt.visibleText;
+        finalReasoningContent = attempt.reasoningContent;
+        streamer = attempt.streamer;
+
+        const textForRefusalCheck = finalVisibleText;
+
+        if (!streamer.hasSentText() && isRefusal(textForRefusalCheck) && retryCount < MAX_REFUSAL_RETRIES) {
+            retryCount++;
+            const retryBody = buildRetryRequest(anthropicReq, retryCount - 1);
+            activeCursorReq = await convertToCursorRequest(retryBody);
+            reasoningSent = false;
+            continue;
+        }
+
+        break;
+    }
+
+    const refusalText = finalVisibleText;
+    const usedFallback = !streamer.hasSentText() && isRefusal(refusalText);
+
+    let finalTextToSend: string;
+    if (usedFallback) {
+        finalTextToSend = isToolCapabilityQuestion(anthropicReq)
+            ? CLAUDE_TOOLS_RESPONSE
+            : CLAUDE_IDENTITY_RESPONSE;
+    } else {
+        finalTextToSend = streamer.finish();
+    }
+
+    if (!usedFallback && thinkingEnabled && finalReasoningContent && !reasoningSent) {
+        writeOpenAIReasoningDelta(res, streamMeta.id, streamMeta.created, streamMeta.model, finalReasoningContent);
+        reasoningSent = true;
+    }
+
+    writeOpenAITextDelta(res, streamMeta.id, streamMeta.created, streamMeta.model, finalTextToSend);
+
+    writeOpenAISSE(res, {
+        id: streamMeta.id,
+        object: 'chat.completion.chunk',
+        created: streamMeta.created,
+        model: streamMeta.model,
+        choices: [{
+            index: 0,
+            delta: {},
+            finish_reason: 'stop',
+        }],
+    });
+
+    res.write('data: [DONE]\n\n');
+    res.end();
+}
+
 // ==================== 流式处理（OpenAI SSE 格式） ====================
 
 async function handleOpenAIStream(
@@ -361,30 +765,37 @@ async function handleOpenAIStream(
     let retryCount = 0;
 
     // 统一缓冲模式：先缓冲全部响应，再检测拒绝和处理
-    const EARLY_REFUSAL_CHECK_THRESHOLD = 300;
-    let earlyAborted = false;
-
     const executeStream = async () => {
         fullResponse = '';
-        earlyAborted = false;
         await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
             if (event.type !== 'text-delta' || !event.delta) return;
             fullResponse += event.delta;
-            // 流中早期拒绝检测：累积够判断字符数后立即检测，确认拒绝则中止流
-            if (fullResponse.length >= EARLY_REFUSAL_CHECK_THRESHOLD && !earlyAborted) {
-                if (isRefusal(fullResponse) && !(hasTools && fullResponse.includes('```json'))) {
-                    earlyAborted = true;
-                    console.log(`[OpenAI] 早期拒绝检测: ${fullResponse.length} chars 后中止流`);
-                    return false;
-                }
-            }
         });
     };
 
     try {
+        if (!hasTools && (!body.response_format || body.response_format.type === 'text')) {
+            await handleOpenAIIncrementalTextStream(res, cursorReq, body, anthropicReq, { id, created, model });
+            return;
+        }
+
         await executeStream();
 
-        console.log(`[OpenAI] 原始响应 (${fullResponse.length} chars, tools=${hasTools}): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
+        // 日志记录在详细日志中 (Web UI 可见)
+
+        // ★ Thinking 提取（在拒绝检测之前）
+        const thinkingEnabled = anthropicReq.thinking?.type === 'enabled';
+        let reasoningContent: string | undefined;
+        if (fullResponse.includes('<thinking>')) {
+            const { thinkingContent: extracted, strippedText } = extractThinking(fullResponse);
+            if (extracted) {
+                if (thinkingEnabled) {
+                    reasoningContent = extracted;
+                }
+                fullResponse = strippedText;
+                // thinking 剥离记录在详细日志中
+            }
+        }
 
         // 拒绝检测 + 自动重试（工具模式和非工具模式均生效）
         const shouldRetryRefusal = () => {
@@ -395,7 +806,7 @@ async function handleOpenAIStream(
 
         while (shouldRetryRefusal() && retryCount < MAX_REFUSAL_RETRIES) {
             retryCount++;
-            console.log(`[OpenAI] 检测到拒绝（第${retryCount}次），自动重试...原始: ${fullResponse.substring(0, 100)}`);
+            // 重试记录在详细日志中
             const retryBody = buildRetryRequest(anthropicReq, retryCount - 1);
             activeCursorReq = await convertToCursorRequest(retryBody);
             await executeStream();
@@ -403,77 +814,42 @@ async function handleOpenAIStream(
         if (shouldRetryRefusal()) {
             if (!hasTools) {
                 if (isToolCapabilityQuestion(anthropicReq)) {
-                    console.log(`[OpenAI] 工具能力询问被拒绝，返回 Claude 能力描述`);
+                    // 记录在详细日志
                     fullResponse = CLAUDE_TOOLS_RESPONSE;
                 } else {
-                    console.log(`[OpenAI] 重试${MAX_REFUSAL_RETRIES}次后仍被拒绝，返回 Claude 身份回复`);
+                    // 记录在详细日志
                     fullResponse = CLAUDE_IDENTITY_RESPONSE;
                 }
             } else {
-                console.log(`[OpenAI] 工具模式下拒绝且无工具调用，引导模型输出`);
-                fullResponse = 'The previous action is unavailable. Continue using other available actions to complete the task.';
+                // 记录在详细日志
+                fullResponse = 'I understand the request. Let me analyze the information and proceed with the appropriate action.';
             }
         }
 
         // 极短响应重试
         if (hasTools && fullResponse.trim().length < 10 && retryCount < MAX_REFUSAL_RETRIES) {
             retryCount++;
-            console.log(`[OpenAI] 响应过短 (${fullResponse.length} chars)，重试第${retryCount}次`);
+            // 记录在详细日志
             activeCursorReq = await convertToCursorRequest(anthropicReq);
             await executeStream();
         }
 
-        // ★ 截断恢复
-        const MAX_STREAM_CONTINUE = 10;
-        let streamContinueCount = 0;
-        const originalStreamMessages = [...activeCursorReq.messages];
-        while (isTruncated(fullResponse) && streamContinueCount < MAX_STREAM_CONTINUE) {
-            streamContinueCount++;
-            console.log(`[OpenAI] 流式：检测到截断 (${fullResponse.length} chars)，续写第${streamContinueCount}次...`);
-            const anchorText = fullResponse.slice(-300);
-            const continuationPrompt = `Your previous response was cut off mid-output. The last part of your output was:
-
-\`\`\`
-...${anchorText}
-\`\`\`
-
-Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
-            const continuationReq: CursorChatRequest = {
-                ...activeCursorReq,
-                messages: [
-                    ...originalStreamMessages,
-                    { parts: [{ type: 'text', text: fullResponse }], id: uuidv4(), role: 'assistant' },
-                    { parts: [{ type: 'text', text: continuationPrompt }], id: uuidv4(), role: 'user' },
-                ],
-            };
-            let continuation = '';
-            await sendCursorRequest(continuationReq, (event: CursorSSEEvent) => {
-                if (event.type !== 'text-delta' || !event.delta) return;
-                continuation += event.delta;
-            });
-            if (!continuation.trim()) break;
-            fullResponse = deduplicateContinuation(fullResponse, continuation);
-            console.log(`[OpenAI] 流式：续写后总长 ${fullResponse.length} chars`);
+        if (hasTools) {
+            fullResponse = await autoContinueCursorToolResponseStream(activeCursorReq, fullResponse, hasTools);
         }
 
         let finishReason: 'stop' | 'tool_calls' = 'stop';
 
-        // ★ Thinking 提取：OpenAI 流式模式下提取 <thinking> 块并作为 reasoning_content 发送
-        const config = getConfig();
-        if (config.enableThinking && fullResponse.includes('<thinking>')) {
-            const extracted = extractThinking(fullResponse);
-            if (extracted.thinkingBlocks.length > 0) {
-                const reasoningContent = extracted.thinkingBlocks.map(b => b.thinking).join('\n\n');
-                fullResponse = extracted.cleanText;
-                writeOpenAISSE(res, {
-                    id, object: 'chat.completion.chunk', created, model,
-                    choices: [{
-                        index: 0,
-                        delta: { reasoning_content: reasoningContent } as never,
-                        finish_reason: null,
-                    }],
-                });
-            }
+        // ★ 发送 reasoning_content（如果有）
+        if (reasoningContent) {
+            writeOpenAISSE(res, {
+                id, object: 'chat.completion.chunk', created, model,
+                choices: [{
+                    index: 0,
+                    delta: { reasoning_content: reasoningContent } as Record<string, unknown>,
+                    finish_reason: null,
+                }],
+            });
         }
 
         if (hasTools && hasToolCalls(fullResponse)) {
@@ -557,7 +933,11 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             }
         } else {
             // 无工具模式或无工具调用 — 统一清洗后发送
-            const sanitized = sanitizeResponse(fullResponse);
+            let sanitized = sanitizeResponse(fullResponse);
+            // ★ response_format 后处理：剥离 markdown 代码块包裹
+            if (body.response_format && body.response_format.type !== 'text') {
+                sanitized = stripMarkdownJsonWrapper(sanitized);
+            }
             if (sanitized) {
                 writeOpenAISSE(res, {
                     id, object: 'chat.completion.chunk', created, model,
@@ -606,80 +986,63 @@ async function handleOpenAINonStream(
     body: OpenAIChatRequest,
     anthropicReq: AnthropicRequest,
 ): Promise<void> {
-    let fullText = await sendCursorRequestFull(cursorReq);
+    let activeCursorReq = cursorReq;
+    let fullText = await sendCursorRequestFull(activeCursorReq);
     const hasTools = (body.tools?.length ?? 0) > 0;
 
-    console.log(`[OpenAI] 非流式原始响应 (${fullText.length} chars, tools=${hasTools}): ${fullText.substring(0, 300)}${fullText.length > 300 ? '...' : ''}`);
+    // 日志记录在详细日志中
 
-    // 拒绝检测 + 自动重试（工具模式和非工具模式均生效）
+    // ★ Thinking 提取必须在拒绝检测之前 — 否则 thinking 内容中的关键词会触发 isRefusal 误判
+    const thinkingEnabled = anthropicReq.thinking?.type === 'enabled';
+    let reasoningContent: string | undefined;
+    if (fullText.includes('<thinking>')) {
+        const { thinkingContent: extracted, strippedText } = extractThinking(fullText);
+        if (extracted) {
+            if (thinkingEnabled) {
+                reasoningContent = extracted;
+            }
+            // thinking 剥离记录
+            fullText = strippedText;
+        }
+    }
+
+    // 拒绝检测 + 自动重试（在 thinking 提取之后，只检测实际输出内容）
     const shouldRetry = () => isRefusal(fullText) && !(hasTools && hasToolCalls(fullText));
 
     if (shouldRetry()) {
         for (let attempt = 0; attempt < MAX_REFUSAL_RETRIES; attempt++) {
-            console.log(`[OpenAI] 非流式：检测到拒绝（第${attempt + 1}次重试）...原始: ${fullText.substring(0, 100)}`);
+            // 重试记录
             const retryBody = buildRetryRequest(anthropicReq, attempt);
             const retryCursorReq = await convertToCursorRequest(retryBody);
-            fullText = await sendCursorRequestFull(retryCursorReq);
+            activeCursorReq = retryCursorReq;
+            fullText = await sendCursorRequestFull(activeCursorReq);
+            // 重试响应也需要先剥离 thinking
+            if (fullText.includes('<thinking>')) {
+                fullText = extractThinking(fullText).strippedText;
+            }
             if (!shouldRetry()) break;
         }
         if (shouldRetry()) {
             if (hasTools) {
-                console.log(`[OpenAI] 非流式：工具模式下拒绝，引导模型输出`);
+                // 记录在详细日志
                 fullText = 'I understand the request. Let me analyze the information and proceed with the appropriate action.';
             } else if (isToolCapabilityQuestion(anthropicReq)) {
-                console.log(`[OpenAI] 非流式：工具能力询问被拒绝，返回 Claude 能力描述`);
+                // 记录在详细日志
                 fullText = CLAUDE_TOOLS_RESPONSE;
             } else {
-                console.log(`[OpenAI] 非流式：重试${MAX_REFUSAL_RETRIES}次后仍被拒绝，返回 Claude 身份回复`);
+                // 记录在详细日志
                 fullText = CLAUDE_IDENTITY_RESPONSE;
             }
         }
     }
 
-    // ★ 截断恢复
-    const MAX_AUTO_CONTINUE = 10;
-    let continueCount = 0;
-    const originalMessages = [...cursorReq.messages];
-    let activeCursorReq = cursorReq;
-    while (isTruncated(fullText) && continueCount < MAX_AUTO_CONTINUE) {
-        continueCount++;
-        console.log(`[OpenAI] 非流式：检测到截断 (${fullText.length} chars)，续写第${continueCount}次...`);
-        const anchorText = fullText.slice(-300);
-        const continuationPrompt = `Your previous response was cut off mid-output. The last part of your output was:
-
-\`\`\`
-...${anchorText}
-\`\`\`
-
-Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
-        const continuationReq: CursorChatRequest = {
-            ...activeCursorReq,
-            messages: [
-                ...originalMessages,
-                { parts: [{ type: 'text', text: fullText }], id: uuidv4(), role: 'assistant' },
-                { parts: [{ type: 'text', text: continuationPrompt }], id: uuidv4(), role: 'user' },
-            ],
-        };
-        const continuation = await sendCursorRequestFull(continuationReq);
-        if (!continuation.trim()) break;
-        fullText = deduplicateContinuation(fullText, continuation);
-        console.log(`[OpenAI] 非流式：续写后总长 ${fullText.length} chars`);
+    if (hasTools) {
+        fullText = await autoContinueCursorToolResponseFull(activeCursorReq, fullText, hasTools);
     }
 
     let content: string | null = fullText;
     let toolCalls: OpenAIToolCall[] | undefined;
     let finishReason: 'stop' | 'tool_calls' = 'stop';
-    let reasoningContent: string | undefined;
-
-    // ★ Thinking 提取：OpenAI 非流式模式下提取 <thinking> 块
-    const config = getConfig();
-    if (config.enableThinking && fullText.includes('<thinking>')) {
-        const extracted = extractThinking(fullText);
-        if (extracted.thinkingBlocks.length > 0) {
-            reasoningContent = extracted.thinkingBlocks.map(b => b.thinking).join('\n\n');
-            fullText = extracted.cleanText;
-        }
-    }
 
     if (hasTools) {
         const parsed = parseToolCalls(fullText);
@@ -689,7 +1052,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             // 清洗拒绝文本
             let cleanText = parsed.cleanText;
             if (isRefusal(cleanText)) {
-                console.log(`[OpenAI] 抑制工具模式下的拒绝文本: ${cleanText.substring(0, 100)}...`);
+                // 记录在详细日志
                 cleanText = '';
             }
             content = sanitizeResponse(cleanText) || null;
@@ -705,7 +1068,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
         } else {
             // 无工具调用，检查拒绝
             if (isRefusal(fullText)) {
-                content = 'The previous action is unavailable. Continue using other available actions to complete the task.';
+                content = 'I understand the request. Let me proceed with the appropriate action. Could you clarify what specific task you would like me to perform?';
             } else {
                 content = sanitizeResponse(fullText);
             }
@@ -713,9 +1076,12 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
     } else {
         // 无工具模式：清洗响应
         content = sanitizeResponse(fullText);
+        // ★ response_format 后处理：剥离 markdown 代码块包裹
+        if (body.response_format && body.response_format.type !== 'text' && content) {
+            content = stripMarkdownJsonWrapper(content);
+        }
     }
 
-    const inputTokens = estimateInputTokens(anthropicReq);
     const response: OpenAIChatCompletion = {
         id: chatId(),
         object: 'chat.completion',
@@ -727,14 +1093,14 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
                 role: 'assistant',
                 content,
                 ...(toolCalls ? { tool_calls: toolCalls } : {}),
-                ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+                ...(reasoningContent ? { reasoning_content: reasoningContent } as Record<string, unknown> : {}),
             },
             finish_reason: finishReason,
         }],
         usage: {
-            prompt_tokens: inputTokens.input_tokens,
+            prompt_tokens: estimateInputTokens(anthropicReq),
             completion_tokens: Math.ceil(fullText.length / 3),
-            total_tokens: inputTokens.input_tokens + Math.ceil(fullText.length / 3),
+            total_tokens: estimateInputTokens(anthropicReq) + Math.ceil(fullText.length / 3),
         },
     };
 
@@ -742,6 +1108,20 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
 }
 
 // ==================== 工具函数 ====================
+
+/**
+ * 剥离 Markdown 代码块包裹，返回裸 JSON 字符串
+ * 处理 ```json\n...\n``` 和 ```\n...\n``` 两种格式
+ */
+function stripMarkdownJsonWrapper(text: string): string {
+    if (!text) return text;
+    const trimmed = text.trim();
+    const match = trimmed.match(/^```(?:json)?\s*\n([\s\S]*?)\n\s*```$/);
+    if (match) {
+        return match[1].trim();
+    }
+    return text;
+}
 
 function writeOpenAISSE(res: Response, data: OpenAIChatCompletionChunk): void {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -753,29 +1133,540 @@ function writeOpenAISSE(res: Response, data: OpenAIChatCompletionChunk): void {
 // ==================== /v1/responses 支持 ====================
 
 /**
- * 处理 Cursor IDE Agent 模式的 /v1/responses 请求
+ * 写入 Responses API SSE 事件
+ * 格式：event: {eventType}\ndata: {json}\n\n
+ * 注意：与 Chat Completions 的 "data: {json}\n\n" 不同，Responses API 需要 event: 前缀
+ */
+function writeResponsesSSE(res: Response, eventType: string, data: Record<string, unknown>): void {
+    res.write(`event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`);
+    if (typeof (res as unknown as { flush: () => void }).flush === 'function') {
+        (res as unknown as { flush: () => void }).flush();
+    }
+}
+
+function responsesId(): string {
+    return 'resp_' + uuidv4().replace(/-/g, '').substring(0, 24);
+}
+
+function responsesItemId(): string {
+    return 'item_' + uuidv4().replace(/-/g, '').substring(0, 24);
+}
+
+/**
+ * 构建 Responses API 的 response 对象骨架
+ */
+function buildResponseObject(
+    id: string,
+    model: string,
+    status: 'in_progress' | 'completed',
+    output: Record<string, unknown>[],
+    usage?: { input_tokens: number; output_tokens: number; total_tokens: number },
+): Record<string, unknown> {
+    return {
+        id,
+        object: 'response',
+        created_at: Math.floor(Date.now() / 1000),
+        status,
+        model,
+        output,
+        ...(usage ? { usage } : {}),
+    };
+}
+
+/**
+ * 处理 OpenAI Codex / Responses API 的 /v1/responses 请求
  *
- * Cursor IDE 对 GPT 模型发送 OpenAI Responses API 格式请求，
- * 这里将其转换为 Chat Completions 格式后复用现有管道
+ * ★ 关键差异：Responses API 的流式格式与 Chat Completions 完全不同
+ * Codex 期望接收 event: response.created / response.output_text.delta / response.completed 等事件
+ * 而非 data: {"object":"chat.completion.chunk",...} 格式
  */
 export async function handleOpenAIResponses(req: Request, res: Response): Promise<void> {
     try {
         const body = req.body;
-        console.log(`[OpenAI] 收到 /v1/responses 请求: model=${body.model}`);
+        const isStream = (body.stream as boolean) ?? true;
 
-        // 将 Responses API 格式转换为 Chat Completions 格式
+        // Step 1: 转换请求格式 Responses → Chat Completions → Anthropic → Cursor
         const chatBody = responsesToChatCompletions(body);
+        const anthropicReq = convertToAnthropicRequest(chatBody);
+        const cursorReq = await convertToCursorRequest(anthropicReq);
 
-        // 此后复用现有管道
-        req.body = chatBody;
-        return handleOpenAIChatCompletions(req, res);
+        // 身份探针拦截
+        if (isIdentityProbe(anthropicReq)) {
+            const mockText = "I am Claude, an advanced AI programming assistant created by Anthropic. I am ready to help you write code, debug, and answer your technical questions.";
+            if (isStream) {
+                return handleResponsesStreamMock(res, body, mockText);
+            } else {
+                return handleResponsesNonStreamMock(res, body, mockText);
+            }
+        }
+
+        if (isStream) {
+            await handleResponsesStream(res, cursorReq, body, anthropicReq);
+        } else {
+            await handleResponsesNonStream(res, cursorReq, body, anthropicReq);
+        }
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         console.error(`[OpenAI] /v1/responses 处理失败:`, message);
-        res.status(500).json({
-            error: { message, type: 'server_error', code: 'internal_error' },
+        const status = err instanceof OpenAIRequestError ? err.status : 500;
+        const type = err instanceof OpenAIRequestError ? err.type : 'server_error';
+        const code = err instanceof OpenAIRequestError ? err.code : 'internal_error';
+        res.status(status).json({
+            error: { message, type, code },
         });
     }
+}
+
+/**
+ * 模拟身份响应 — 流式 (Responses API SSE 格式)
+ */
+function handleResponsesStreamMock(res: Response, body: Record<string, unknown>, mockText: string): void {
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+    });
+
+    const respId = responsesId();
+    const itemId = responsesItemId();
+    const model = (body.model as string) || 'gpt-4';
+
+    emitResponsesTextStream(res, respId, itemId, model, mockText, 0, { input_tokens: 15, output_tokens: 35, total_tokens: 50 });
+    res.end();
+}
+
+/**
+ * 模拟身份响应 — 非流式 (Responses API JSON 格式)
+ */
+function handleResponsesNonStreamMock(res: Response, body: Record<string, unknown>, mockText: string): void {
+    const respId = responsesId();
+    const itemId = responsesItemId();
+    const model = (body.model as string) || 'gpt-4';
+
+    res.json(buildResponseObject(respId, model, 'completed', [{
+        id: itemId,
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: mockText, annotations: [] }],
+    }], { input_tokens: 15, output_tokens: 35, total_tokens: 50 }));
+}
+
+/**
+ * 发射完整的 Responses API 文本流事件序列
+ * 包含从 response.created 到 response.completed 的完整生命周期
+ */
+function emitResponsesTextStream(
+    res: Response,
+    respId: string,
+    itemId: string,
+    model: string,
+    fullText: string,
+    outputIndex: number,
+    usage: { input_tokens: number; output_tokens: number; total_tokens: number },
+    toolCallItems?: Record<string, unknown>[],
+): void {
+    // 所有输出项（文本 + 工具调用）
+    const messageItem: Record<string, unknown> = {
+        id: itemId,
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: fullText, annotations: [] }],
+    };
+    const allOutputItems = toolCallItems ? [...toolCallItems, messageItem] : [messageItem];
+
+    // 1. response.created
+    writeResponsesSSE(res, 'response.created', buildResponseObject(respId, model, 'in_progress', []));
+
+    // 2. response.in_progress
+    writeResponsesSSE(res, 'response.in_progress', buildResponseObject(respId, model, 'in_progress', []));
+
+    // 3. 文本 output item
+    writeResponsesSSE(res, 'response.output_item.added', {
+        output_index: outputIndex,
+        item: {
+            id: itemId,
+            type: 'message',
+            role: 'assistant',
+            status: 'in_progress',
+            content: [],
+        },
+    });
+
+    // 4. content part
+    writeResponsesSSE(res, 'response.content_part.added', {
+        output_index: outputIndex,
+        content_index: 0,
+        part: { type: 'output_text', text: '', annotations: [] },
+    });
+
+    // 5. 文本增量
+    if (fullText) {
+        // 分块发送，模拟流式体验 (每块约 100 字符)
+        const CHUNK_SIZE = 100;
+        for (let i = 0; i < fullText.length; i += CHUNK_SIZE) {
+            writeResponsesSSE(res, 'response.output_text.delta', {
+                output_index: outputIndex,
+                content_index: 0,
+                delta: fullText.slice(i, i + CHUNK_SIZE),
+            });
+        }
+    }
+
+    // 6. response.output_text.done
+    writeResponsesSSE(res, 'response.output_text.done', {
+        output_index: outputIndex,
+        content_index: 0,
+        text: fullText,
+    });
+
+    // 7. response.content_part.done
+    writeResponsesSSE(res, 'response.content_part.done', {
+        output_index: outputIndex,
+        content_index: 0,
+        part: { type: 'output_text', text: fullText, annotations: [] },
+    });
+
+    // 8. response.output_item.done (message)
+    writeResponsesSSE(res, 'response.output_item.done', {
+        output_index: outputIndex,
+        item: messageItem,
+    });
+
+    // 9. response.completed — ★ 这是 Codex 等待的关键事件
+    writeResponsesSSE(res, 'response.completed', buildResponseObject(respId, model, 'completed', allOutputItems, usage));
+}
+
+/**
+ * Responses API 流式处理
+ *
+ * ★ 与 Chat Completions 流式的核心区别：
+ * 1. 使用 event: 前缀的 SSE 事件（不是 data-only）
+ * 2. 必须发送 response.completed 事件，否则 Codex 报 "stream closed before response.completed"
+ * 3. 工具调用用 function_call 类型的 output item 表示
+ */
+async function handleResponsesStream(
+    res: Response,
+    cursorReq: CursorChatRequest,
+    body: Record<string, unknown>,
+    anthropicReq: AnthropicRequest,
+): Promise<void> {
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+    });
+
+    const respId = responsesId();
+    const model = (body.model as string) || 'gpt-4';
+    const hasTools = (anthropicReq.tools?.length ?? 0) > 0;
+
+    // 缓冲完整响应再处理（复用 Chat Completions 的逻辑）
+    let fullResponse = '';
+    let activeCursorReq = cursorReq;
+    let retryCount = 0;
+
+    // ★ 流式保活：防止网关 504
+    const keepaliveInterval = setInterval(() => {
+        try {
+            res.write(': keepalive\n\n');
+            if (typeof (res as unknown as { flush: () => void }).flush === 'function') {
+                (res as unknown as { flush: () => void }).flush();
+            }
+        } catch { /* connection already closed */ }
+    }, 15000);
+
+    try {
+        const executeStream = async () => {
+            fullResponse = '';
+            await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
+                if (event.type !== 'text-delta' || !event.delta) return;
+                fullResponse += event.delta;
+            });
+        };
+
+        await executeStream();
+
+        // Thinking 提取
+        if (fullResponse.includes('<thinking>')) {
+            const { strippedText } = extractThinking(fullResponse);
+            fullResponse = strippedText;
+        }
+
+        // 拒绝检测 + 自动重试
+        const shouldRetryRefusal = () => {
+            if (!isRefusal(fullResponse)) return false;
+            if (hasTools && hasToolCalls(fullResponse)) return false;
+            return true;
+        };
+
+        while (shouldRetryRefusal() && retryCount < MAX_REFUSAL_RETRIES) {
+            retryCount++;
+            const retryBody = buildRetryRequest(anthropicReq, retryCount - 1);
+            activeCursorReq = await convertToCursorRequest(retryBody);
+            await executeStream();
+            if (fullResponse.includes('<thinking>')) {
+                fullResponse = extractThinking(fullResponse).strippedText;
+            }
+        }
+
+        if (shouldRetryRefusal()) {
+            if (isToolCapabilityQuestion(anthropicReq)) {
+                fullResponse = CLAUDE_TOOLS_RESPONSE;
+            } else {
+                fullResponse = CLAUDE_IDENTITY_RESPONSE;
+            }
+        }
+
+        if (hasTools) {
+            fullResponse = await autoContinueCursorToolResponseStream(activeCursorReq, fullResponse, hasTools);
+        }
+
+        // 清洗响应
+        fullResponse = sanitizeResponse(fullResponse);
+
+        // 计算 usage
+        const inputTokens = estimateInputTokens(anthropicReq);
+        const outputTokens = Math.ceil(fullResponse.length / 3);
+        const usage = { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens };
+
+        // ★ 工具调用解析 + Responses API 格式输出
+        if (hasTools && hasToolCalls(fullResponse)) {
+            const { toolCalls, cleanText } = parseToolCalls(fullResponse);
+
+            if (toolCalls.length > 0) {
+                // 1. response.created + response.in_progress
+                writeResponsesSSE(res, 'response.created', buildResponseObject(respId, model, 'in_progress', []));
+                writeResponsesSSE(res, 'response.in_progress', buildResponseObject(respId, model, 'in_progress', []));
+
+                const allOutputItems: Record<string, unknown>[] = [];
+                let outputIndex = 0;
+
+                // 2. 每个工具调用 → function_call output item
+                for (const tc of toolCalls) {
+                    const callId = toolCallId();
+                    const fcItemId = responsesItemId();
+                    const argsStr = JSON.stringify(tc.arguments);
+
+                    // output_item.added (function_call)
+                    writeResponsesSSE(res, 'response.output_item.added', {
+                        output_index: outputIndex,
+                        item: {
+                            id: fcItemId,
+                            type: 'function_call',
+                            name: tc.name,
+                            call_id: callId,
+                            arguments: '',
+                            status: 'in_progress',
+                        },
+                    });
+
+                    // function_call_arguments.delta — 分块发送
+                    const CHUNK_SIZE = 128;
+                    for (let j = 0; j < argsStr.length; j += CHUNK_SIZE) {
+                        writeResponsesSSE(res, 'response.function_call_arguments.delta', {
+                            output_index: outputIndex,
+                            delta: argsStr.slice(j, j + CHUNK_SIZE),
+                        });
+                    }
+
+                    // function_call_arguments.done
+                    writeResponsesSSE(res, 'response.function_call_arguments.done', {
+                        output_index: outputIndex,
+                        arguments: argsStr,
+                    });
+
+                    // output_item.done (function_call)
+                    const completedFcItem = {
+                        id: fcItemId,
+                        type: 'function_call',
+                        name: tc.name,
+                        call_id: callId,
+                        arguments: argsStr,
+                        status: 'completed',
+                    };
+                    writeResponsesSSE(res, 'response.output_item.done', {
+                        output_index: outputIndex,
+                        item: completedFcItem,
+                    });
+
+                    allOutputItems.push(completedFcItem);
+                    outputIndex++;
+                }
+
+                // 3. 如果有纯文本部分，也发送 message output item
+                let textContent = sanitizeResponse(isRefusal(cleanText) ? '' : cleanText);
+                if (textContent) {
+                    const msgItemId = responsesItemId();
+                    writeResponsesSSE(res, 'response.output_item.added', {
+                        output_index: outputIndex,
+                        item: { id: msgItemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
+                    });
+                    writeResponsesSSE(res, 'response.content_part.added', {
+                        output_index: outputIndex, content_index: 0,
+                        part: { type: 'output_text', text: '', annotations: [] },
+                    });
+                    writeResponsesSSE(res, 'response.output_text.delta', {
+                        output_index: outputIndex, content_index: 0, delta: textContent,
+                    });
+                    writeResponsesSSE(res, 'response.output_text.done', {
+                        output_index: outputIndex, content_index: 0, text: textContent,
+                    });
+                    writeResponsesSSE(res, 'response.content_part.done', {
+                        output_index: outputIndex, content_index: 0,
+                        part: { type: 'output_text', text: textContent, annotations: [] },
+                    });
+                    const msgItem = {
+                        id: msgItemId, type: 'message', role: 'assistant', status: 'completed',
+                        content: [{ type: 'output_text', text: textContent, annotations: [] }],
+                    };
+                    writeResponsesSSE(res, 'response.output_item.done', { output_index: outputIndex, item: msgItem });
+                    allOutputItems.push(msgItem);
+                }
+
+                // 4. response.completed — ★ Codex 等待的关键事件
+                writeResponsesSSE(res, 'response.completed', buildResponseObject(respId, model, 'completed', allOutputItems, usage));
+            } else {
+                // 工具调用解析失败（误报）→ 作为纯文本发送
+                const msgItemId = responsesItemId();
+                emitResponsesTextStream(res, respId, msgItemId, model, fullResponse, 0, usage);
+            }
+        } else {
+            // 纯文本响应
+            const msgItemId = responsesItemId();
+            emitResponsesTextStream(res, respId, msgItemId, model, fullResponse, 0, usage);
+        }
+    } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        // 尝试发送错误后的 response.completed，确保 Codex 不会等待超时
+        try {
+            const errorText = `[Error: ${message}]`;
+            const errorItemId = responsesItemId();
+            writeResponsesSSE(res, 'response.created', buildResponseObject(respId, model, 'in_progress', []));
+            writeResponsesSSE(res, 'response.output_item.added', {
+                output_index: 0,
+                item: { id: errorItemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
+            });
+            writeResponsesSSE(res, 'response.content_part.added', {
+                output_index: 0, content_index: 0,
+                part: { type: 'output_text', text: '', annotations: [] },
+            });
+            writeResponsesSSE(res, 'response.output_text.delta', {
+                output_index: 0, content_index: 0, delta: errorText,
+            });
+            writeResponsesSSE(res, 'response.output_text.done', {
+                output_index: 0, content_index: 0, text: errorText,
+            });
+            writeResponsesSSE(res, 'response.content_part.done', {
+                output_index: 0, content_index: 0,
+                part: { type: 'output_text', text: errorText, annotations: [] },
+            });
+            writeResponsesSSE(res, 'response.output_item.done', {
+                output_index: 0,
+                item: { id: errorItemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: errorText, annotations: [] }] },
+            });
+            writeResponsesSSE(res, 'response.completed', buildResponseObject(respId, model, 'completed', [{
+                id: errorItemId, type: 'message', role: 'assistant', status: 'completed',
+                content: [{ type: 'output_text', text: errorText, annotations: [] }],
+            }], { input_tokens: 0, output_tokens: 10, total_tokens: 10 }));
+        } catch { /* ignore double error */ }
+    } finally {
+        clearInterval(keepaliveInterval);
+    }
+
+    res.end();
+}
+
+/**
+ * Responses API 非流式处理
+ */
+async function handleResponsesNonStream(
+    res: Response,
+    cursorReq: CursorChatRequest,
+    body: Record<string, unknown>,
+    anthropicReq: AnthropicRequest,
+): Promise<void> {
+    let activeCursorReq = cursorReq;
+    let fullText = await sendCursorRequestFull(activeCursorReq);
+    const hasTools = (anthropicReq.tools?.length ?? 0) > 0;
+
+    // Thinking 提取
+    if (fullText.includes('<thinking>')) {
+        fullText = extractThinking(fullText).strippedText;
+    }
+
+    // 拒绝检测 + 重试
+    const shouldRetry = () => isRefusal(fullText) && !(hasTools && hasToolCalls(fullText));
+    if (shouldRetry()) {
+        for (let attempt = 0; attempt < MAX_REFUSAL_RETRIES; attempt++) {
+            const retryBody = buildRetryRequest(anthropicReq, attempt);
+            const retryCursorReq = await convertToCursorRequest(retryBody);
+            activeCursorReq = retryCursorReq;
+            fullText = await sendCursorRequestFull(activeCursorReq);
+            if (fullText.includes('<thinking>')) {
+                fullText = extractThinking(fullText).strippedText;
+            }
+            if (!shouldRetry()) break;
+        }
+        if (shouldRetry()) {
+            if (isToolCapabilityQuestion(anthropicReq)) {
+                fullText = CLAUDE_TOOLS_RESPONSE;
+            } else {
+                fullText = CLAUDE_IDENTITY_RESPONSE;
+            }
+        }
+    }
+
+    if (hasTools) {
+        fullText = await autoContinueCursorToolResponseFull(activeCursorReq, fullText, hasTools);
+    }
+
+    fullText = sanitizeResponse(fullText);
+
+    const respId = responsesId();
+    const model = (body.model as string) || 'gpt-4';
+    const inputTokens = estimateInputTokens(anthropicReq);
+    const outputTokens = Math.ceil(fullText.length / 3);
+    const usage = { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens };
+
+    const output: Record<string, unknown>[] = [];
+
+    if (hasTools && hasToolCalls(fullText)) {
+        const { toolCalls, cleanText } = parseToolCalls(fullText);
+        for (const tc of toolCalls) {
+            output.push({
+                id: responsesItemId(),
+                type: 'function_call',
+                name: tc.name,
+                call_id: toolCallId(),
+                arguments: JSON.stringify(tc.arguments),
+                status: 'completed',
+            });
+        }
+        const textContent = sanitizeResponse(isRefusal(cleanText) ? '' : cleanText);
+        if (textContent) {
+            output.push({
+                id: responsesItemId(),
+                type: 'message',
+                role: 'assistant',
+                status: 'completed',
+                content: [{ type: 'output_text', text: textContent, annotations: [] }],
+            });
+        }
+    } else {
+        output.push({
+            id: responsesItemId(),
+            type: 'message',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ type: 'output_text', text: fullText, annotations: [] }],
+        });
+    }
+
+    res.json(buildResponseObject(respId, model, 'completed', output, usage));
 }
 
 /**
@@ -801,26 +1692,29 @@ export function responsesToChatCompletions(body: Record<string, unknown>): OpenA
             if (item.type === 'function_call_output') {
                 messages.push({
                     role: 'tool',
-                    content: (item.output as string) || '',
+                    content: stringifyUnknownContent(item.output),
                     tool_call_id: (item.call_id as string) || '',
                 });
                 continue;
             }
             const role = (item.role as string) || 'user';
             if (role === 'system' || role === 'developer') {
-                const text = typeof item.content === 'string'
-                    ? item.content
-                    : Array.isArray(item.content)
-                        ? (item.content as Array<Record<string, unknown>>).filter(b => b.type === 'input_text').map(b => b.text as string).join('\n')
-                        : String(item.content || '');
+                const text = extractOpenAIContent({
+                    role: 'system',
+                    content: (item.content as string | OpenAIContentPart[] | null) ?? null,
+                } as OpenAIMessage);
                 messages.push({ role: 'system', content: text });
             } else if (role === 'user') {
-                const content = typeof item.content === 'string'
-                    ? item.content
-                    : Array.isArray(item.content)
-                        ? (item.content as Array<Record<string, unknown>>).filter(b => b.type === 'input_text').map(b => b.text as string).join('\n')
-                        : String(item.content || '');
-                messages.push({ role: 'user', content });
+                const rawContent = (item.content as string | OpenAIContentPart[] | null) ?? null;
+                const normalizedContent = typeof rawContent === 'string'
+                    ? rawContent
+                    : Array.isArray(rawContent) && rawContent.every(b => b.type === 'input_text')
+                        ? rawContent.map(b => b.text || '').join('\n')
+                        : rawContent;
+                messages.push({
+                    role: 'user',
+                    content: normalizedContent || '',
+                });
             } else if (role === 'assistant') {
                 const blocks = Array.isArray(item.content) ? item.content as Array<Record<string, unknown>> : [];
                 const text = blocks.filter(b => b.type === 'output_text').map(b => b.text as string).join('\n');

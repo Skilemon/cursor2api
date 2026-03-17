@@ -215,6 +215,28 @@ export function getProxyFetchOptions(): Record<string, unknown> {
     return cachedAgent ? { dispatcher: cachedAgent } : {};
 }
 
+let cachedVisionAgent: ProxyAgent | undefined;
+
+/**
+ * ★ Vision 独立代理：优先使用 vision.proxy，否则回退到全局 proxy
+ * Cursor API 国内可直连不需要代理，但图片分析 API 可能需要
+ */
+export function getVisionProxyFetchOptions(): Record<string, unknown> {
+    const config = getConfig();
+    const visionProxy = config.vision?.proxy;
+
+    if (visionProxy) {
+        if (!cachedVisionAgent) {
+            console.log(`[Proxy] Vision 独立代理: ${visionProxy}`);
+            cachedVisionAgent = new ProxyAgent(visionProxy);
+        }
+        return { dispatcher: cachedVisionAgent };
+    }
+
+    // 回退到全局代理
+    return getProxyFetchOptions();
+}
+
 // 进程退出时释放租约
 process.on('SIGTERM', async () => { await destroyCurrent(); process.exit(0); });
 process.on('SIGINT', async () => { await destroyCurrent(); process.exit(0); });

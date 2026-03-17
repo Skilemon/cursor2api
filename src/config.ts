@@ -63,6 +63,31 @@ export function getConfig(): AppConfig {
                     earlyMsgMaxChars: typeof c.early_msg_max_chars === 'number' ? c.early_msg_max_chars : 2000,
                 };
             }
+            // ★ Thinking 开关（最高优先级）
+            if (yaml.thinking !== undefined) {
+                config.thinking = {
+                    enabled: yaml.thinking.enabled !== false,
+                };
+            }
+            // ★ 日志文件持久化
+            if (yaml.logging !== undefined) {
+                config.logging = {
+                    file_enabled: yaml.logging.file_enabled === true,
+                    dir: yaml.logging.dir || './logs',
+                    max_days: typeof yaml.logging.max_days === 'number' ? yaml.logging.max_days : 7,
+                };
+            }
+            // ★ 工具处理配置
+            if (yaml.tools !== undefined) {
+                const t = yaml.tools;
+                const validModes = ['compact', 'full', 'names_only'];
+                config.tools = {
+                    schemaMode: validModes.includes(t.schema_mode) ? t.schema_mode : 'compact',
+                    descriptionMaxLength: typeof t.description_max_length === 'number' ? t.description_max_length : 50,
+                    includeOnly: Array.isArray(t.include_only) ? t.include_only.map(String) : undefined,
+                    exclude: Array.isArray(t.exclude) ? t.exclude.map(String) : undefined,
+                };
+            }
         } catch (e) {
             console.warn('[Config] 读取 config.yaml 失败:', e);
         }
@@ -88,6 +113,22 @@ export function getConfig(): AppConfig {
             if (!config.compression) config.compression = { enabled: true, level: 2, keepRecent: 6, earlyMsgMaxChars: 2000 };
             config.compression.level = lvl as 1 | 2 | 3;
         }
+    }
+
+    // THINKING_ENABLED 环境变量覆盖
+    if (process.env.THINKING_ENABLED !== undefined) {
+        if (!config.thinking) config.thinking = { enabled: true };
+        config.thinking.enabled = process.env.THINKING_ENABLED === 'true' || process.env.THINKING_ENABLED === '1';
+    }
+
+    // 日志文件持久化环境变量覆盖
+    if (process.env.LOG_FILE_ENABLED !== undefined) {
+        if (!config.logging) config.logging = { file_enabled: false, dir: './logs', max_days: 7 };
+        config.logging.file_enabled = process.env.LOG_FILE_ENABLED === 'true' || process.env.LOG_FILE_ENABLED === '1';
+    }
+    if (process.env.LOG_DIR !== undefined) {
+        if (!config.logging) config.logging = { file_enabled: false, dir: './logs', max_days: 7 };
+        config.logging.dir = process.env.LOG_DIR;
     }
 
     // 从 base64 FP 环境变量解析指纹

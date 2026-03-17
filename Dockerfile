@@ -50,14 +50,21 @@ RUN npm ci --omit=dev \
 # 从 builder 阶段拷贝编译后的产物
 COPY --from=builder --chown=cursor:nodejs /app/dist ./dist
 
-# 拷贝默认配置文件（可通过 volume 挂载覆盖）
-COPY --chown=cursor:nodejs config.yaml ./config.yaml
+# 拷贝前端静态资源（日志查看器 Web UI）
+COPY --chown=cursor:nodejs public ./public
+
+# 创建日志目录并授权
+RUN mkdir -p /app/logs && chown cursor:nodejs /app/logs
+
+# 注意：config.yaml 不打包进镜像，通过 docker-compose volumes 挂载
+# 如果未挂载，服务会使用内置默认值 + 环境变量
 
 # 切换到非 root 用户
 USER cursor
 
-# 声明对外暴露的端口
+# 声明对外暴露的端口和持久化卷
 EXPOSE 3010
+VOLUME ["/app/logs"]
 
 # 启动服务
 CMD ["npm", "start"]
