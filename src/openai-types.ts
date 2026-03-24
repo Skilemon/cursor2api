@@ -4,6 +4,7 @@ export interface OpenAIChatRequest {
     model: string;
     messages: OpenAIMessage[];
     stream?: boolean;
+    stream_options?: { include_usage?: boolean };
     temperature?: number;
     top_p?: number;
     max_tokens?: number;
@@ -11,13 +12,13 @@ export interface OpenAIChatRequest {
     tools?: OpenAITool[];
     tool_choice?: string | { type: string; function?: { name: string } };
     stop?: string | string[];
+    n?: number;
+    frequency_penalty?: number;
+    presence_penalty?: number;
     response_format?: {
         type: 'text' | 'json_object' | 'json_schema';
         json_schema?: { name?: string; schema?: Record<string, unknown> };
     };
-    n?: number;
-    frequency_penalty?: number;
-    presence_penalty?: number;
 }
 
 export interface OpenAIMessage {
@@ -90,6 +91,11 @@ export interface OpenAIChatCompletionChunk {
     created: number;
     model: string;
     choices: OpenAIStreamChoice[];
+    usage?: {
+        prompt_tokens: number;
+        completion_tokens: number;
+        total_tokens: number;
+    };
 }
 
 export interface OpenAIStreamChoice {

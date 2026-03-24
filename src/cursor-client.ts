@@ -4,14 +4,14 @@
  * 职责：
  * 1. 发送请求到 https://cursor.com/api/chat（带 Chrome TLS 指纹模拟 headers）
  * 2. 流式解析 SSE 响应
- * 3. 自动重试（最多 5 次）
+ * 3. 自动重试（最多 2 次）
  *
  * 注：x-is-human token 验证已被 Cursor 停用，直接发送空字符串即可。
  */
 
 import type { CursorChatRequest, CursorSSEEvent } from './types.js';
 import { getConfig } from './config.js';
-import { getProxyFetchOptions, rotateProxy, getCurrentProxyUrl } from './proxy-agent.js';
+import { getProxyFetchOptions } from './proxy-agent.js';
 
 const CURSOR_CHAT_API = 'https://cursor.com/api/chat';
 
@@ -47,29 +47,23 @@ function getChromeHeaders(): Record<string, string> {
  */
 export async function sendCursorRequest(
     req: CursorChatRequest,
-    onChunk: (event: CursorSSEEvent) => boolean | void,
+    onChunk: (event: CursorSSEEvent) => void,
+    externalSignal?: AbortSignal,
 ): Promise<void> {
-    const maxRetries = 5;
+    const maxRetries = 2;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            await sendCursorRequestInner(req, onChunk);
+            await sendCursorRequestInner(req, onChunk, externalSignal);
             return;
         } catch (err) {
+            // 外部主动中止不重试
+            if (externalSignal?.aborted) throw err;
+            // ★ 退化循环中止不重试 — 已有的内容是有效的，重试也会重蹈覆辙
+            if (err instanceof Error && err.message === 'DEGENERATE_LOOP_ABORTED') return;
             const msg = err instanceof Error ? err.message : String(err);
-            // 主动中止（早期拒绝检测）不是网络失败，直接返回让上层处理
-            if (err instanceof Error && err.name === 'AbortError') return;
-            if (msg.includes('This operation was aborted')) return;
-            console.error(`[Cursor] 请求失败 (${attempt}/${maxRetries}): ${msg}`);
-            // 4xx 错误（除 429）换代理也无法解决，直接抛出
-            const httpMatch = msg.match(/HTTP (\d+)/);
-            if (httpMatch) {
-                const status = parseInt(httpMatch[1]);
-                if (status >= 400 && status < 500 && status !== 429) {
-                    throw err;
-                }
-            }
+            console.error(`[Cursor] 请求失败 (${attempt}/${maxRetries}): ${msg.substring(0, 100)}`);
             if (attempt < maxRetries) {
-                await rotateProxy();
+                await new Promise(r => setTimeout(r, 2000));
             } else {
                 throw err;
             }
@@ -79,26 +73,25 @@ export async function sendCursorRequest(
 
 async function sendCursorRequestInner(
     req: CursorChatRequest,
-    onChunk: (event: CursorSSEEvent) => boolean | void,
+    onChunk: (event: CursorSSEEvent) => void,
+    externalSignal?: AbortSignal,
 ): Promise<void> {
     const headers = getChromeHeaders();
 
-    const proxyInfo = getCurrentProxyUrl() ?? 'none';
-    const workerIndex = process.env.WORKER_INDEX ?? '?';
-    console.log(`[Cursor] 发送请求: worker=${workerIndex}, model=${req.model}, messages=${req.messages.length}, proxy=${proxyInfo}, time=${new Date().toISOString()}`);
+    // 详细日志记录在 handler 层
 
     const config = getConfig();
     const controller = new AbortController();
+    // 链接外部信号：外部中止时同步中止内部 controller
+    if (externalSignal) {
+        if (externalSignal.aborted) { controller.abort(); }
+        else { externalSignal.addEventListener('abort', () => controller.abort(), { once: true }); }
+    }
 
-    // 连接超时：等待服务器开始响应的最长时间（TCP+TLS+首字节）
-    const CONNECT_TIMEOUT_MS = 15000;
-    let connectTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-        console.warn('[Cursor] 连接超时（15s 未收到响应头），中止请求');
-        controller.abort();
-    }, CONNECT_TIMEOUT_MS);
-
-    // 空闲超时：流式读取时，指定时间内无新数据则中断
-    const IDLE_TIMEOUT_MS = config.timeout * 1000;
+    // ★ 空闲超时（Idle Timeout）：用读取活动检测替换固定总时长超时。
+    // 每次收到新数据时重置计时器，只有在指定时间内完全无数据到达时才中断。
+    // 这样长输出（如写长文章、大量工具调用）不会因总时长超限被误杀。
+    const IDLE_TIMEOUT_MS = config.timeout * 1000; // 复用 timeout 配置作为空闲超时阈值
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
     const resetIdleTimer = () => {
@@ -109,6 +102,9 @@ async function sendCursorRequestInner(
         }, IDLE_TIMEOUT_MS);
     };
 
+    // 启动初始计时（等待服务器开始响应）
+    resetIdleTimer();
+
     try {
         const resp = await fetch(CURSOR_CHAT_API, {
             method: 'POST',
@@ -117,12 +113,6 @@ async function sendCursorRequestInner(
             signal: controller.signal,
             ...getProxyFetchOptions(),
         } as any);
-
-        // 已收到响应头，清除连接超时，改用空闲超时保护流式读取
-        if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
-        resetIdleTimer();
-
-        console.log(`[Cursor] 收到响应头: HTTP ${resp.status} ${resp.statusText}`);
 
         if (!resp.ok) {
             const body = await resp.text();
@@ -134,40 +124,23 @@ async function sendCursorRequestInner(
         }
 
         // 流式读取 SSE 响应
-        // 优化：游标偏移法，每次只扫描新增 chunk，避免 O(n²) 全量 split
         const reader = resp.body.getReader();
         const decoder = new TextDecoder();
-        let tail = '';          // 仅保留最后一个未完成行，不累积历史
-        let eventCount = 0;
-        let textDeltaCount = 0;
-        const otherEvents: string[] = [];
+        let buffer = '';
 
-        const processEvent = (data: string) => {
-            if (data === '[DONE]') return;
-            try {
-                const event: CursorSSEEvent = JSON.parse(data);
-                eventCount++;
-                if (event.type === 'text-delta') {
-                    textDeltaCount++;
-                } else {
-                    otherEvents.push(data);
-                }
-                const result = onChunk(event);
-                if (result === false) {
-                    // 回调返回 false 表示请求方希望提前中止（如检测到拒绝）
-                    controller.abort();
-                }
-            } catch {
-                // 非 JSON 数据，原样记录
-                otherEvents.push(data);
-            }
-        };
+        // ★ 退化重复检测器 (#66)
+        // 模型有时会陷入循环，不断输出 </s>、</br> 等无意义标记
+        // 检测原理：跟踪最近的连续相同 delta，超过阈值则中止流
+        let lastDelta = '';
+        let repeatCount = 0;
+        const REPEAT_THRESHOLD = 8;       // 同一 delta 连续出现 8 次 → 退化
+        let degenerateAborted = false;
 
-        const processLine = (line: string) => {
-            if (!line.startsWith('data: ')) return;
-            const data = line.slice(6).trim();
-            if (data) processEvent(data);
-        };
+        // ★ HTML token 重复检测：历史消息较多时模型偶发连续输出 <br>、</s> 等 HTML token 的 bug
+        // 用 tagBuffer 跨 delta 拼接，提取完整 token 后检测连续重复，不依赖换行
+        let tagBuffer = '';
+        let htmlRepeatAborted = false;
+        const HTML_TOKEN_RE = /(<\/?[a-z][a-z0-9]*\s*\/?>|&[a-z]+;)/gi;
 
         while (true) {
             const { done, value } = await reader.read();
@@ -176,50 +149,116 @@ async function sendCursorRequestInner(
             // 每次收到数据就重置空闲计时器
             resetIdleTimer();
 
-            // 拼接当前 chunk，只向后扫描新换行符，旧内容不重复扫描
-            const chunk = decoder.decode(value, { stream: true });
-            const combined = tail + chunk;
-            const lastNl = combined.lastIndexOf('\n');
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
 
-            if (lastNl === -1) {
-                tail = combined;
-            } else {
-                const lines = combined.slice(0, lastNl).split('\n');
-                tail = combined.slice(lastNl + 1);
-                for (const line of lines) {
-                    processLine(line);
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                const data = line.slice(6).trim();
+                if (!data) continue;
+
+                try {
+                    const event: CursorSSEEvent = JSON.parse(data);
+
+                    // ★ 退化重复检测：当模型重复输出同一短文本片段时中止
+                    if (event.type === 'text-delta' && event.delta) {
+                        const trimmedDelta = event.delta.trim();
+                        // 只检测短 token（长文本重复是正常的，比如重复的代码行）
+                        if (trimmedDelta.length > 0 && trimmedDelta.length <= 20) {
+                            if (trimmedDelta === lastDelta) {
+                                repeatCount++;
+                                if (repeatCount >= REPEAT_THRESHOLD) {
+                                    console.warn(`[Cursor] ⚠️ 检测到退化循环: "${trimmedDelta}" 已连续重复 ${repeatCount} 次，中止流`);
+                                    degenerateAborted = true;
+                                    reader.cancel();
+                                    break;
+                                }
+                            } else {
+                                lastDelta = trimmedDelta;
+                                repeatCount = 1;
+                            }
+                        } else {
+                            // 长文本或空白 → 重置计数
+                            lastDelta = '';
+                            repeatCount = 0;
+                        }
+
+                        // ★ HTML token 重复检测：跨 delta 拼接，提取完整 HTML token 后检测连续重复
+                        // 解决 <br>、</s>、&nbsp; 等被拆散发送或无换行导致退化检测失效的 bug
+                        tagBuffer += event.delta;
+                        const tagMatches = [...tagBuffer.matchAll(new RegExp(HTML_TOKEN_RE.source, 'gi'))];
+                        if (tagMatches.length > 0) {
+                            const lastTagMatch = tagMatches[tagMatches.length - 1];
+                            tagBuffer = tagBuffer.slice(lastTagMatch.index! + lastTagMatch[0].length);
+                            for (const m of tagMatches) {
+                                const token = m[0].toLowerCase();
+                                if (token === lastDelta) {
+                                    repeatCount++;
+                                    if (repeatCount >= REPEAT_THRESHOLD) {
+                                        console.warn(`[Cursor] ⚠️ 检测到 HTML token 重复: "${token}" 已连续重复 ${repeatCount} 次，中止流`);
+                                        htmlRepeatAborted = true;
+                                        reader.cancel();
+                                        break;
+                                    }
+                                } else {
+                                    lastDelta = token;
+                                    repeatCount = 1;
+                                }
+                            }
+                            if (htmlRepeatAborted) break;
+                        } else if (tagBuffer.length > 20) {
+                            // 超过 20 字符还没有完整 HTML token，不是 HTML 序列，清空避免内存累积
+                            tagBuffer = '';
+                        }
+                    }
+
+                    onChunk(event);
+                } catch {
+                    // 非 JSON 数据，忽略
                 }
             }
+
+            if (degenerateAborted || htmlRepeatAborted) break;
         }
 
-        // 处理流结束时残留的不完整行
-        if (tail) processLine(tail);
+        // ★ 退化循环中止后，抛出特殊错误让外层 sendCursorRequest 不再重试
+        if (degenerateAborted) {
+            throw new Error('DEGENERATE_LOOP_ABORTED');
+        }
+        // ★ HTML token 重复中止后，抛出普通错误让外层 sendCursorRequest 走正常重试
+        if (htmlRepeatAborted) {
+            throw new Error('HTML_REPEAT_ABORTED');
+        }
 
-        console.log(`[Cursor] 流读取完成: 共${eventCount}个事件, text-delta=${textDeltaCount}`);
-        if (textDeltaCount === 0 && otherEvents.length > 0) {
-            console.warn(`[Cursor] 无 text-delta 事件，收到的其他事件:`);
-            for (const e of otherEvents) {
-                console.warn(`  ${e}`);
+        // 处理剩余 buffer
+        if (buffer.startsWith('data: ')) {
+            const data = buffer.slice(6).trim();
+            if (data) {
+                try {
+                    const event: CursorSSEEvent = JSON.parse(data);
+                    onChunk(event);
+                } catch { /* ignore */ }
             }
         }
-        if (eventCount === 0) {
-            throw new Error('Cursor 返回空响应（0个SSE事件），可能被代理拦截或账号异常');
-        }
     } finally {
-        if (connectTimer) clearTimeout(connectTimer);
         if (idleTimer) clearTimeout(idleTimer);
     }
 }
 
 /**
- * 发送非流式请求，收集完整响应
+ * 发送非流式请求，收集完整响应及 usage 信息
  */
-export async function sendCursorRequestFull(req: CursorChatRequest): Promise<string> {
+export async function sendCursorRequestFull(req: CursorChatRequest): Promise<{ text: string; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number } }> {
     let fullText = '';
+    let usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } | undefined;
     await sendCursorRequest(req, (event) => {
         if (event.type === 'text-delta' && event.delta) {
             fullText += event.delta;
         }
+        if (event.messageMetadata?.usage) {
+            usage = event.messageMetadata.usage;
+        }
     });
-    return fullText;
+    return { text: fullText, usage };
 }

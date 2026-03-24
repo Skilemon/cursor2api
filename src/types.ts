@@ -102,6 +102,14 @@ export interface CursorPart {
 export interface CursorSSEEvent {
     type: string;
     delta?: string;
+    finishReason?: string;
+    messageMetadata?: {
+        usage?: {
+            inputTokens?: number;
+            outputTokens?: number;
+            totalTokens?: number;
+        };
+    };
 }
 
 // ==================== Internal Types ====================
@@ -122,7 +130,9 @@ export interface AppConfig {
     mihomo?: string;
     workers?: number;
     cursorModel: string;
-    enableThinking?: boolean;
+    maxAutoContinue: number;
+    maxHistoryMessages: number;
+    maxHistoryTokens: number;
     vision?: {
         enabled: boolean;
         mode: 'ocr' | 'api';
@@ -131,10 +141,6 @@ export interface AppConfig {
         model: string;
         proxy?: string;
     };
-    fingerprint: {
-        userAgent: string;
-    };
-    authTokens?: string[];
     compression?: {
         enabled: boolean;
         level: 1 | 2 | 3;
@@ -142,17 +148,28 @@ export interface AppConfig {
         earlyMsgMaxChars: number;
     };
     thinking?: {
-        enabled: boolean;          // 是否启用 thinking（最高优先级，覆盖客户端请求）
+        enabled: boolean;
     };
     logging?: {
-        file_enabled: boolean;     // 是否启用日志文件持久化
-        dir: string;               // 日志文件存储目录
-        max_days: number;          // 日志保留天数
+        file_enabled: boolean;
+        dir: string;
+        max_days: number;
+        persist_mode: 'compact' | 'full' | 'summary';
+        db_enabled: boolean;
+        db_path: string;
     };
     tools?: {
-        schemaMode: 'compact' | 'full' | 'names_only';  // Schema 呈现模式
-        descriptionMaxLength: number;                     // 描述截断长度 (0=不截断)
-        includeOnly?: string[];                           // 白名单：只保留的工具名
-        exclude?: string[];                               // 黑名单：要排除的工具名
+        schemaMode: 'compact' | 'full' | 'names_only';
+        descriptionMaxLength: number;
+        includeOnly?: string[];
+        exclude?: string[];
+        passthrough?: boolean;
+        disabled?: boolean;
     };
+    sanitizeEnabled: boolean;
+    refusalPatterns?: string[];
+    fingerprint: {
+        userAgent: string;
+    };
+    authTokens?: string[];
 }

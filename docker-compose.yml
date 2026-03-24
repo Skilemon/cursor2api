@@ -10,9 +10,8 @@ services:
       - "${PORT:-3010}:3010"
     volumes:
       # 挂载配置文件（可选）——先从 config.yaml.example 复制一份: cp config.yaml.example config.yaml
-      # 修改后只需 docker compose restart 即可生效；不挂载则使用内置默认值 + 环境变量
       - ./config.yaml:/app/config.yaml:ro
-      # 日志持久化目录（需要在 config.yaml 或环境变量中开启 logging.file_enabled）
+      # 日志持久化目录
       - ./logs:/app/logs
     environment:
       - NODE_ENV=production
@@ -22,33 +21,46 @@ services:
       - WORKERS=${WORKERS:-4}
 
       # ── 代理配置 ──
-      # 代理池 API（多进程模式）
+      # 代理池 API（多进程模式，配合内置分配服务）
       # - PROXY_POOL_URL=${PROXY_POOL_URL:-}
-      # 静态代理（单进程模式）
+      # 静态代理（单进程或每 Worker 同一代理）
       # - PROXY=http://user:pass@ip:port
 
       # [可选环境变量] 以下变量如果声明，将会覆盖 config.yaml 中对应的配置：
       # - CURSOR_MODEL=anthropic/claude-sonnet-4.6
 
       # ── API 鉴权 ──
-      # 公网部署时强烈建议开启，多个 token 用逗号分隔
       # - AUTH_TOKEN=sk-your-secret-token-1,sk-your-secret-token-2
 
       # ── Thinking 开关（最高优先级，覆盖 config.yaml） ──
-      # true=始终启用思考链, false=强制关闭
       # - THINKING_ENABLED=true
 
       # ── 历史消息压缩 ──
       # - COMPRESSION_ENABLED=true
       # - COMPRESSION_LEVEL=2
 
-      # ── 日志持久化 ──
+      # ── 历史消息限制 ──
+      # - MAX_AUTO_CONTINUE=0
+      # - MAX_HISTORY_MESSAGES=-1
+      # - MAX_HISTORY_TOKENS=120000
+
+      # ── 日志持久化（⚠️ 修改后需重启容器生效） ──
+      # 方式一：JSONL 文件
       # - LOG_FILE_ENABLED=true
       # - LOG_DIR=./logs
+      # 方式二：SQLite（推荐）
+      # - LOG_DB_ENABLED=true
+      # - LOG_DB_PATH=./logs/cursor2api.db
 
       # ── 浏览器指纹（base64 JSON） ──
       # - FP=eyJ1c2VyQWdlbnQiOiIuLi4ifQ==
 
       # ── Vision 图片处理 ──
-      # 默认使用本地 OCR（零配置），如需外部 Vision API 请在 config.yaml 中修改 vision.mode 为 'api'
-      # 并配置 vision.base_url / vision.api_key / vision.model
+      # 默认使用本地 OCR（零配置），如需外部 Vision API 请在 config.yaml 中配置
+
+      # ── 工具模式 ──
+      # - TOOLS_PASSTHROUGH=true
+      # - TOOLS_DISABLED=true
+
+      # ── 响应内容清洗 ──
+      # - SANITIZE_RESPONSE=true

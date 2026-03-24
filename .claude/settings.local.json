@@ -37,7 +37,18 @@
       "Bash(done)",
       "Bash(grep -v '^[<>] *$')",
       "Bash(grep -v '^[<>] *//')",
-      "Bash(grep -v '^[<>] *$\\\\|^[<>] *//')"
+      "Bash(grep -v '^[<>] *$\\\\|^[<>] *//')",
+      "Read(//mnt/d/开发/**)",
+      "Read(//mnt/d/开发/cursor2api/**)",
+      "Bash(cp \"cursor2api-2.7.7/src/handler.ts\" \"src/handler.ts\")",
+      "Bash(cp \"cursor2api-2.7.7/src/openai-handler.ts\" \"src/openai-handler.ts\")",
+      "Bash(cp \"cursor2api-2.7.7/src/converter.ts\" \"src/converter.ts\")",
+      "Bash(cp \"cursor2api-2.7.7/src/log-viewer.ts\" \"src/log-viewer.ts\")",
+      "Bash(cp \"cursor2api-2.7.7/src/logger.ts\" \"src/logger.ts\")",
+      "Bash(node_modules/.bin/tsc)",
+      "Bash(npm install:*)",
+      "Bash(node_modules/.bin/tsc --noEmit)",
+      "Bash(npm run:*)"
     ]
   }
 }

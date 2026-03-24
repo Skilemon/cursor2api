@@ -65,10 +65,62 @@ vision:
   # model: "meta-llama/llama-3.2-11b-vision-instruct:free"
   # proxy: "http://127.0.0.1:7890"  # 视觉 API 单独走代理（留空则跟随全局代理）
 
-# 历史消息压缩配置（可选）
+# ==================== 自动续写配置 ====================
+# 当模型输出被截断时，自动发起续写请求的最大次数
+# 默认 0（禁用），由客户端（如 Claude Code）自行处理续写
+# 环境变量: MAX_AUTO_CONTINUE=0
+max_auto_continue: 0
+
+# ==================== 历史消息条数硬限制 ====================
+# 设为 -1 不限制消息条数
+# 环境变量: MAX_HISTORY_MESSAGES=-1
+max_history_messages: -1
+
+# ==================== 历史消息 Token 数硬限制（推荐） ====================
+# 按 js-tiktoken 估算 token 数裁剪历史，比按条数更精准
+# 参考值：110000～130000；设为 -1 不限制
+# 环境变量: MAX_HISTORY_TOKENS=120000
+max_history_tokens: 120000
+
+# ==================== Thinking 开关（最高优先级） ====================
+# 设为 true: 强制启用 thinking
+# 设为 false: 强制关闭 thinking
+# 不配置：跟随客户端请求（默认）
+# 环境变量: THINKING_ENABLED=true
+# thinking:
+#   enabled: false
+
+# ==================== 历史消息压缩配置（可选） ====================
 # 当对话历史过长时，自动压缩早期消息以节省 token
 # compression:
 #   enabled: true          # 是否启用压缩，默认 false
 #   level: 2               # 压缩力度：1=轻度(仅截断) 2=中度(摘要) 3=重度(极度压缩)，默认 2
-#   keep_recent: 6         # 保留最近 N 条消息不压缩，默认 6
-#   early_msg_max_chars: 2000  # 早期消息最多保留字符数，默认 2000
+#   keep_recent: 10        # 保留最近 N 条消息不压缩，默认 10
+#   early_msg_max_chars: 4000  # 早期消息最多保留字符数，默认 4000
+
+# ==================== 工具模式配置（可选） ====================
+# tools:
+#   disabled: false           # 完全禁用工具传递
+#   passthrough: false        # 直接透传不处理
+#   schema_mode: "full"       # compact | full | names_only
+#   description_max_length: 0 # 0=不限制
+#   include_only: []          # 白名单工具名列表
+#   exclude: []               # 黑名单工具名列表
+
+# ==================== 响应内容清洗（可选） ====================
+# 开启后过滤模型输出中的敏感/无效内容
+# sanitize_response: false
+
+# ==================== 日志持久化配置（可选） ====================
+# 支持 JSONL 文件和 SQLite 两种方式，可同时开启
+logging:
+  # 方式一：JSONL 文件持久化（默认关闭）
+  file_enabled: false
+  dir: "./logs"
+  max_days: 7
+  # persist_mode: compact | full | summary
+  persist_mode: summary
+
+  # 方式二：SQLite 数据库持久化（推荐，默认关闭）
+  db_enabled: false
+  db_path: "./logs/cursor2api.db"
