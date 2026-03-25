@@ -35,6 +35,7 @@ function parseYamlConfig(defaults: AppConfig): { config: AppConfig; raw: Record<
         if (yaml.mihomo) result.mihomo = yaml.mihomo;
         if (yaml.workers) result.workers = yaml.workers;
         if (yaml.cursor_model) result.cursorModel = yaml.cursor_model;
+        if (typeof yaml.max_cursor_retries === 'number') result.maxCursorRetries = yaml.max_cursor_retries;
         if (typeof yaml.max_auto_continue === 'number') result.maxAutoContinue = yaml.max_auto_continue;
         if (typeof yaml.max_history_messages === 'number') result.maxHistoryMessages = yaml.max_history_messages;
         if (typeof yaml.max_history_tokens === 'number') result.maxHistoryTokens = yaml.max_history_tokens;
@@ -59,11 +60,20 @@ function parseYamlConfig(defaults: AppConfig): { config: AppConfig; raw: Record<
         if (yaml.auth_token) result.authTokens = [String(yaml.auth_token)];
         if (yaml.compression !== undefined) {
             const c = yaml.compression;
+            // ★ level预设参数映射，默认值跟随level而非硬编码
+            const levelDefaults: Record<number, { keepRecent: number; earlyMsgMaxChars: number; briefTextLen: number }> = {
+                1: { keepRecent: 10, earlyMsgMaxChars: 4000, briefTextLen: 800 },
+                2: { keepRecent: 6,  earlyMsgMaxChars: 2000, briefTextLen: 500 },
+                3: { keepRecent: 4,  earlyMsgMaxChars: 1000, briefTextLen: 200 },
+            };
+            const lvl = [1, 2, 3].includes(c.level) ? c.level : 2;
+            const ld = levelDefaults[lvl];
             result.compression = {
                 enabled: c.enabled !== false,
-                level: [1, 2, 3].includes(c.level) ? c.level : 1,
-                keepRecent: typeof c.keep_recent === 'number' ? c.keep_recent : 10,
-                earlyMsgMaxChars: typeof c.early_msg_max_chars === 'number' ? c.early_msg_max_chars : 4000,
+                level: lvl as 1 | 2 | 3,
+                keepRecent: typeof c.keep_recent === 'number' ? c.keep_recent : ld.keepRecent,
+                earlyMsgMaxChars: typeof c.early_msg_max_chars === 'number' ? c.early_msg_max_chars : ld.earlyMsgMaxChars,
+                briefTextLen: typeof c.brief_text_len === 'number' ? c.brief_text_len : ld.briefTextLen,
             };
         }
         if (yaml.thinking !== undefined) {
@@ -181,6 +191,7 @@ function defaultConfig(): AppConfig {
     return {
         port: 3010,
         timeout: 120,
+        maxCursorRetries: 2,
         cursorModel: 'anthropic/claude-sonnet-4.6',
         maxAutoContinue: 0,
         maxHistoryMessages: -1,

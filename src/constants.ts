@@ -204,7 +204,7 @@ export const IDENTITY_PROBE_PATTERNS: RegExp[] = [
     /system\s*prompt/i,
     // "你是谁"的变体
     /你\s*(?:到底|究竟|真的|真实)\s*是\s*谁/,
-    /你\s*是[^。，,\.]{0,5}(?:AI|人工智能|助手|机器人|模型|Claude|GPT|Gemini)/i,
+    /^\s*你\s*是[^。，,\.]{0,10}(?:AI|人工智能|机器人|模型|Claude|GPT|Gemini)[^。，,\.]{0,5}\??\s*$/i, // 仅匹配纯身份询问短句
     // 注意：工具能力询问不在这里拦截，由拒绝检测+重试自然处理
 ];
 
@@ -217,15 +217,15 @@ export const TOOL_CAPABILITY_PATTERNS: RegExp[] = [
     /你\s*用\s*(?:什么|哪个|啥)\s*(?:mcp|工具)/i,
     /你\s*(?:能|可以)\s*(?:做|干)\s*(?:什么|哪些|啥)/,
     /(?:what|which).*?(?:capabilities|functions)/i,
-    /能力|功能/,
+    /你.*?(?:的|有哪些|具备).*?(?:能力|功能)/,  // 精确匹配：询问你的能力/功能
 ];
 
 // ==================== 固定回复模板 ====================
 
 /** Claude 身份回复（身份探针拦截 / 拒绝后降级） */
-export const CLAUDE_IDENTITY_RESPONSE = `I am Claude, made by Anthropic. I'm an AI assistant designed to be helpful, harmless, and honest. I can help you with a wide range of tasks including writing, analysis, coding, math, and more.
+export const CLAUDE_IDENTITY_RESPONSE = `我是 Claude，由 Anthropic 开发的 AI 助手。我可以帮助你完成写作、分析、编程、数学推理等各类任务。
 
-I don't have information about the specific model version or ID being used for this conversation, but I'm happy to help you with whatever you need!`;
+I am Claude, made by Anthropic. I can help you with a wide range of tasks including writing, analysis, coding, math, and more. Feel free to ask me anything!`;
 
 /** 工具能力询问的模拟回复（当用户问"你有哪些工具"时） */
 export const CLAUDE_TOOLS_RESPONSE = `作为 Claude，我的核心能力包括：

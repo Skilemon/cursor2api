@@ -41,6 +41,9 @@ import {
     CLAUDE_IDENTITY_RESPONSE,
     CLAUDE_TOOLS_RESPONSE,
     MAX_REFUSAL_RETRIES,
+    TOOL_CHOICE_MAX_RETRIES,
+    MIN_VALID_RESPONSE_CHARS,
+    buildForceToolCallMessage,
     estimateInputTokens,
 } from './handler.js';
 
@@ -227,6 +230,20 @@ function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
         stop_sequences: body.stop
             ? (Array.isArray(body.stop) ? body.stop : [body.stop])
             : undefined,
+        // ★ tool_choice 映射：OpenAI → Anthropic
+        // "required" / "any" → { type: 'any' }；"auto" → { type: 'auto' }；指定工具名 → { type: 'tool', name }
+        tool_choice: (() => {
+            const tc = (body as unknown as Record<string, unknown>).tool_choice;
+            if (!tc || !tools?.length) return undefined;
+            if (tc === 'required' || tc === 'any') return { type: 'any' as const };
+            if (tc === 'auto') return { type: 'auto' as const };
+            if (tc === 'none') return undefined;
+            if (typeof tc === 'object' && (tc as Record<string, unknown>).type === 'function') {
+                const name = ((tc as Record<string, unknown>).function as Record<string, unknown>)?.name as string;
+                return name ? { type: 'tool' as const, name } : { type: 'any' as const };
+            }
+            return undefined;
+        })(),
         // ★ Thinking 开关：config.yaml 优先级最高
         // enabled=true: 强制注入 thinking（即使客户端没请求）
         // enabled=false: 强制关闭 thinking
@@ -478,7 +495,7 @@ export async function handleOpenAIChatCompletions(req: Request, res: Response): 
         // Step 1.6: 身份探针拦截（复用 Anthropic handler 的逻辑）
         if (isIdentityProbe(anthropicReq)) {
             log.intercepted('身份探针拦截 (OpenAI)');
-            const mockText = "I am Claude, an advanced AI programming assistant created by Anthropic. I am ready to help you write code, debug, and answer your technical questions. Please let me know what we should work on!";
+            const mockText = CLAUDE_IDENTITY_RESPONSE;
             if (body.stream) {
                 return handleOpenAIMockStream(res, body, mockText);
             } else {
@@ -962,7 +979,7 @@ async function handleOpenAIStream(
         }
 
         // 极短响应重试
-        if (hasTools && fullResponse.trim().length < 10 && retryCount < MAX_REFUSAL_RETRIES) {
+        if (hasTools && fullResponse.trim().length < MIN_VALID_RESPONSE_CHARS && retryCount < MAX_REFUSAL_RETRIES) {
             retryCount++;
             activeCursorReq = await convertToCursorRequest(anthropicReq);
             await executeStream();
@@ -970,6 +987,33 @@ async function handleOpenAIStream(
 
         if (hasTools) {
             fullResponse = await autoContinueCursorToolResponseStream(activeCursorReq, fullResponse, hasTools);
+        }
+
+        // ★ tool_choice=any 强制重试（与 Anthropic 路径对齐）
+        {
+            const toolChoiceType = anthropicReq.tool_choice?.type;
+            const { toolCalls: tcCheck } = parseToolCalls(fullResponse);
+            let toolChoiceRetry = 0;
+            while (
+                toolChoiceType === 'any' &&
+                tcCheck.length === 0 &&
+                toolChoiceRetry < TOOL_CHOICE_MAX_RETRIES
+            ) {
+                toolChoiceRetry++;
+                log.warn('OpenAI', 'retry', `tool_choice=any 但模型未调用工具（第${toolChoiceRetry}次），强制重试`);
+                const forceMsg = buildForceToolCallMessage(anthropicReq.tools || [], fullResponse || '(no response)');
+                activeCursorReq = {
+                    ...activeCursorReq,
+                    messages: [...activeCursorReq.messages, {
+                        parts: [{ type: 'text', text: fullResponse || '(no response)' }],
+                        id: crypto.randomUUID(),
+                        role: 'assistant',
+                    }, forceMsg],
+                };
+                await executeStream();
+                const { toolCalls: tcRetry } = parseToolCalls(fullResponse);
+                if (tcRetry.length > 0) break;
+            }
         }
 
         let finishReason: 'stop' | 'tool_calls' = 'stop';
@@ -1371,7 +1415,7 @@ export async function handleOpenAIResponses(req: Request, res: Response): Promis
         // 身份探针拦截
         if (isIdentityProbe(anthropicReq)) {
             log.intercepted('身份探针拦截 (Responses)');
-            const mockText = "I am Claude, an advanced AI programming assistant created by Anthropic. I am ready to help you write code, debug, and answer your technical questions.";
+            const mockText = CLAUDE_IDENTITY_RESPONSE;
             if (isStream) {
                 return handleResponsesStreamMock(res, body, mockText);
             } else {
@@ -1607,6 +1651,40 @@ async function handleResponsesStream(
             fullResponse = await autoContinueCursorToolResponseStream(activeCursorReq, fullResponse, hasTools);
         }
 
+        // ★ 极短响应重试
+        if (hasTools && fullResponse.trim().length < MIN_VALID_RESPONSE_CHARS && retryCount < MAX_REFUSAL_RETRIES) {
+            retryCount++;
+            activeCursorReq = await convertToCursorRequest(anthropicReq);
+            await executeStream();
+        }
+
+        // ★ tool_choice=any 强制重试（Responses 流式路径）
+        {
+            const toolChoiceType = anthropicReq.tool_choice?.type;
+            const { toolCalls: tcCheck } = parseToolCalls(fullResponse);
+            let toolChoiceRetry = 0;
+            while (
+                toolChoiceType === 'any' &&
+                tcCheck.length === 0 &&
+                toolChoiceRetry < TOOL_CHOICE_MAX_RETRIES
+            ) {
+                toolChoiceRetry++;
+                log.warn('OpenAI', 'retry', `Responses流式 tool_choice=any 但模型未调用工具（第${toolChoiceRetry}次），强制重试`);
+                const forceMsgRS = buildForceToolCallMessage(anthropicReq.tools || [], fullResponse || '(no response)');
+                activeCursorReq = {
+                    ...activeCursorReq,
+                    messages: [
+                        ...activeCursorReq.messages,
+                        { parts: [{ type: 'text', text: fullResponse || '(no response)' }], id: crypto.randomUUID(), role: 'assistant' },
+                        forceMsgRS,
+                    ],
+                };
+                await executeStream();
+                const { toolCalls: tcRetry } = parseToolCalls(fullResponse);
+                if (tcRetry.length > 0) break;
+            }
+        }
+
         // 清洗响应
         fullResponse = sanitizeResponse(fullResponse);
 
@@ -1812,6 +1890,39 @@ async function handleResponsesNonStream(
 
     if (hasTools) {
         fullText = await autoContinueCursorToolResponseFull(activeCursorReq, fullText, hasTools);
+    }
+
+    // ★ 极短响应重试
+    if (hasTools && fullText.trim().length < MIN_VALID_RESPONSE_CHARS) {
+        activeCursorReq = await convertToCursorRequest(anthropicReq);
+        ({ text: fullText } = await sendCursorRequestFull(activeCursorReq));
+    }
+
+    // ★ tool_choice=any 强制重试（Responses 非流式路径）
+    {
+        const toolChoiceType = anthropicReq.tool_choice?.type;
+        const { toolCalls: tcCheck } = parseToolCalls(fullText);
+        let toolChoiceRetry = 0;
+        while (
+            toolChoiceType === 'any' &&
+            tcCheck.length === 0 &&
+            toolChoiceRetry < TOOL_CHOICE_MAX_RETRIES
+        ) {
+            toolChoiceRetry++;
+            log.warn('OpenAI', 'retry', `Responses tool_choice=any 但模型未调用工具（第${toolChoiceRetry}次），强制重试`);
+            const forceMsgR = buildForceToolCallMessage(anthropicReq.tools || [], fullText || '(no response)');
+            activeCursorReq = {
+                ...activeCursorReq,
+                messages: [
+                    ...activeCursorReq.messages,
+                    { parts: [{ type: 'text' as const, text: fullText || '(no response)' }], id: crypto.randomUUID(), role: 'assistant' as const },
+                    forceMsgR,
+                ],
+            };
+            ({ text: fullText } = await sendCursorRequestFull(activeCursorReq));
+            const { toolCalls: tcRetry } = parseToolCalls(fullText);
+            if (tcRetry.length > 0) break;
+        }
     }
 
     fullText = sanitizeResponse(fullText);

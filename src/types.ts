@@ -1,10 +1,5 @@
 // ==================== Anthropic API Types ====================
 
-export type AnthropicResponseFormat =
-    | { type: 'text' }
-    | { type: 'json_object' }
-    | { type: 'json_schema'; json_schema: { name: string; strict?: boolean; schema: Record<string, unknown> } };
-
 export interface AnthropicRequest {
     model: string;
     messages: AnthropicMessage[];
@@ -16,7 +11,6 @@ export interface AnthropicRequest {
     temperature?: number;
     top_p?: number;
     stop_sequences?: string[];
-    response_format?: AnthropicResponseFormat;
     thinking?: { type: 'enabled' | 'disabled' | 'adaptive'; budget_tokens?: number };
 }
 
@@ -36,13 +30,10 @@ export interface AnthropicMessage {
 }
 
 export interface AnthropicContentBlock {
-    type: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'image';
+    type: 'text' | 'tool_use' | 'tool_result' | 'image';
     text?: string;
-    // thinking fields (Anthropic extended thinking)
-    thinking?: string;
-    signature?: string;
     // image fields
-    source?: { type: string; media_type?: string; data?: string; url?: string };
+    source?: { type: string; media_type?: string; data: string; url?: string };
     // tool_use fields
     id?: string;
     name?: string;
@@ -67,7 +58,7 @@ export interface AnthropicResponse {
     model: string;
     stop_reason: string;
     stop_sequence: string | null;
-    usage: { input_tokens: number; output_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number };
+    usage: { input_tokens: number; output_tokens: number };
 }
 
 // ==================== Cursor API Types ====================
@@ -78,8 +69,6 @@ export interface CursorChatRequest {
     id: string;
     messages: CursorMessage[];
     trigger: string;
-    maxTokens?: number;
-    max_tokens?: number;
 }
 
 export interface CursorContext {
@@ -122,6 +111,7 @@ export interface ParsedToolCall {
 export interface AppConfig {
     port: number;
     timeout: number;
+    maxCursorRetries: number;   // Cursor 请求失败时的最大重试次数，默认 2
     proxy?: string;
     proxyPoolUrl?: string;
     proxyList?: string[];
@@ -130,46 +120,47 @@ export interface AppConfig {
     mihomo?: string;
     workers?: number;
     cursorModel: string;
-    maxAutoContinue: number;
-    maxHistoryMessages: number;
-    maxHistoryTokens: number;
+    authTokens?: string[];  // API 鉴权 token 列表，为空则不鉴权
+    maxAutoContinue: number;        // 自动续写最大次数，默认 3，设 0 禁用
+    maxHistoryMessages: number;     // 历史消息条数硬限制，默认 -1（不限制）
+    maxHistoryTokens: number;       // 历史消息 token 数上限（tiktoken 估算我们发出的内容，代码自动加 Cursor 后端开销：1300 基础 + perTool*工具数），默认 150000，-1 不限制
     vision?: {
         enabled: boolean;
         mode: 'ocr' | 'api';
         baseUrl: string;
         apiKey: string;
         model: string;
-        proxy?: string;
+        proxy?: string;  // vision 独立代理（不影响 Cursor API 直连）
     };
     compression?: {
-        enabled: boolean;
-        level: 1 | 2 | 3;
-        keepRecent: number;
-        earlyMsgMaxChars: number;
+        enabled: boolean;          // 是否启用历史消息压缩
+        level: 1 | 2 | 3;         // 压缩级别: 1=轻度, 2=中等(默认), 3=激进
+        keepRecent: number;        // 保留最近 N 条消息不压缩
+        earlyMsgMaxChars: number;  // 早期消息最大字符数
+        briefTextLen?: number;     // 早期消息保留的纯文本摘要长度（可选，覆盖level预设）
     };
     thinking?: {
-        enabled: boolean;
+        enabled: boolean;          // 是否启用 thinking（最高优先级，覆盖客户端请求）
     };
     logging?: {
-        file_enabled: boolean;
-        dir: string;
-        max_days: number;
-        persist_mode: 'compact' | 'full' | 'summary';
-        db_enabled: boolean;
-        db_path: string;
+        file_enabled: boolean;     // 是否启用日志文件持久化
+        dir: string;               // 日志文件存储目录
+        max_days: number;          // 日志保留天数
+        persist_mode: 'compact' | 'full' | 'summary'; // 落盘模式: compact=精简, full=完整, summary=仅问答摘要
+        db_enabled: boolean;       // 是否启用 SQLite 存储
+        db_path: string;           // SQLite 文件路径，默认 './logs/cursor2api.db'
     };
     tools?: {
-        schemaMode: 'compact' | 'full' | 'names_only';
-        descriptionMaxLength: number;
-        includeOnly?: string[];
-        exclude?: string[];
-        passthrough?: boolean;
-        disabled?: boolean;
+        schemaMode: 'compact' | 'full' | 'names_only';  // Schema 呈现模式
+        descriptionMaxLength: number;                     // 描述截断长度 (0=不截断)
+        includeOnly?: string[];                           // 白名单：只保留的工具名
+        exclude?: string[];                               // 黑名单：要排除的工具名
+        passthrough?: boolean;                            // 透传模式：跳过 few-shot 注入，直接嵌入工具定义
+        disabled?: boolean;                               // 禁用模式：完全不注入工具定义，最大化节省上下文
     };
-    sanitizeEnabled: boolean;
-    refusalPatterns?: string[];
+    sanitizeEnabled: boolean;    // 是否启用响应内容清洗（替换 Cursor 身份引用为 Claude），默认 false
+    refusalPatterns?: string[];  // 自定义拒绝检测规则（追加到内置列表之后）
     fingerprint: {
         userAgent: string;
     };
-    authTokens?: string[];
 }

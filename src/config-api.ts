@@ -12,19 +12,23 @@ export function apiGetConfig(_req: Request, res: Response): void {
     res.json({
         cursor_model: cfg.cursorModel,
         timeout: cfg.timeout,
+        max_cursor_retries: cfg.maxCursorRetries,
         max_auto_continue: cfg.maxAutoContinue,
         max_history_messages: cfg.maxHistoryMessages,
         max_history_tokens: cfg.maxHistoryTokens,
         thinking: cfg.thinking !== undefined ? { enabled: cfg.thinking.enabled } : null,
         compression: {
             enabled: cfg.compression?.enabled ?? false,
-            level: cfg.compression?.level ?? 1,
-            keep_recent: cfg.compression?.keepRecent ?? 10,
-            early_msg_max_chars: cfg.compression?.earlyMsgMaxChars ?? 4000,
+            level: cfg.compression?.level ?? 2,
+            keep_recent: cfg.compression?.keepRecent ?? 6,
+            early_msg_max_chars: cfg.compression?.earlyMsgMaxChars ?? 2000,
+            brief_text_len: cfg.compression?.briefTextLen ?? 500,
         },
         tools: {
             schema_mode: cfg.tools?.schemaMode ?? 'full',
             description_max_length: cfg.tools?.descriptionMaxLength ?? 0,
+            include_only: cfg.tools?.includeOnly,
+            exclude: cfg.tools?.exclude,
             passthrough: cfg.tools?.passthrough ?? false,
             disabled: cfg.tools?.disabled ?? false,
         },
@@ -57,6 +61,9 @@ export function apiSaveConfig(req: Request, res: Response): void {
     if (body.max_history_tokens !== undefined && typeof body.max_history_tokens !== 'number') {
         res.status(400).json({ error: 'max_history_tokens must be a number' }); return;
     }
+    if (body.max_cursor_retries !== undefined && (typeof body.max_cursor_retries !== 'number' || body.max_cursor_retries < 0)) {
+        res.status(400).json({ error: 'max_cursor_retries must be a non-negative number' }); return;
+    }
 
     try {
         // 读取现有 yaml（如不存在则从空对象开始）
@@ -88,6 +95,10 @@ export function apiSaveConfig(req: Request, res: Response): void {
         if (body.max_history_tokens !== undefined && body.max_history_tokens !== raw.max_history_tokens) {
             changes.push(`max_history_tokens: ${raw.max_history_tokens ?? '(unset)'} → ${body.max_history_tokens}`);
             raw.max_history_tokens = body.max_history_tokens;
+        }
+        if (body.max_cursor_retries !== undefined && body.max_cursor_retries !== raw.max_cursor_retries) {
+            changes.push(`max_cursor_retries: ${raw.max_cursor_retries ?? '(unset)'} → ${body.max_cursor_retries}`);
+            raw.max_cursor_retries = body.max_cursor_retries;
         }
         if (body.thinking !== undefined) {
             const t = body.thinking as { enabled: boolean | null } | null;

@@ -50,7 +50,7 @@ export async function sendCursorRequest(
     onChunk: (event: CursorSSEEvent) => void,
     externalSignal?: AbortSignal,
 ): Promise<void> {
-    const maxRetries = 2;
+    const maxRetries = getConfig().maxCursorRetries ?? 2;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
             await sendCursorRequestInner(req, onChunk, externalSignal);
@@ -63,7 +63,8 @@ export async function sendCursorRequest(
             const msg = err instanceof Error ? err.message : String(err);
             console.error(`[Cursor] 请求失败 (${attempt}/${maxRetries}): ${msg.substring(0, 100)}`);
             if (attempt < maxRetries) {
-                await new Promise(r => setTimeout(r, 2000));
+                const backoffMs = 1000 * Math.pow(2, attempt - 1); // 1s, 2s, 4s...
+                await new Promise(r => setTimeout(r, backoffMs));
             } else {
                 throw err;
             }
@@ -138,8 +139,11 @@ async function sendCursorRequestInner(
 
         // ★ HTML token 重复检测：历史消息较多时模型偶发连续输出 <br>、</s> 等 HTML token 的 bug
         // 用 tagBuffer 跨 delta 拼接，提取完整 token 后检测连续重复，不依赖换行
+        // ★ 独立状态变量，避免与退化检测的 lastDelta/repeatCount 互相干扰
         let tagBuffer = '';
         let htmlRepeatAborted = false;
+        let htmlLastToken = '';
+        let htmlRepeatCount = 0;
         const HTML_TOKEN_RE = /(<\/?[a-z][a-z0-9]*\s*\/?>|&[a-z]+;)/gi;
 
         while (true) {
@@ -193,17 +197,17 @@ async function sendCursorRequestInner(
                             tagBuffer = tagBuffer.slice(lastTagMatch.index! + lastTagMatch[0].length);
                             for (const m of tagMatches) {
                                 const token = m[0].toLowerCase();
-                                if (token === lastDelta) {
-                                    repeatCount++;
-                                    if (repeatCount >= REPEAT_THRESHOLD) {
-                                        console.warn(`[Cursor] ⚠️ 检测到 HTML token 重复: "${token}" 已连续重复 ${repeatCount} 次，中止流`);
+                                if (token === htmlLastToken) {
+                                    htmlRepeatCount++;
+                                    if (htmlRepeatCount >= REPEAT_THRESHOLD) {
+                                        console.warn(`[Cursor] ⚠️ 检测到 HTML token 重复: "${token}" 已连续重复 ${htmlRepeatCount} 次，中止流`);
                                         htmlRepeatAborted = true;
                                         reader.cancel();
                                         break;
                                     }
                                 } else {
-                                    lastDelta = token;
-                                    repeatCount = 1;
+                                    htmlLastToken = token;
+                                    htmlRepeatCount = 1;
                                 }
                             }
                             if (htmlRepeatAborted) break;
