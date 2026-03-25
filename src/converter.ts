@@ -31,6 +31,15 @@ import { getVisionProxyFetchOptions } from './proxy-agent.js';
 
 // ==================== 工具指令构建 ====================
 
+/** 追加到 Write 工具 description 末尾的分块写入限制 */
+const WRITE_TOOL_DESCRIPTION_SUFFIX = '\n- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use the Edit tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.';
+
+/** 追加到 Edit 工具 description 末尾的分块写入限制 */
+const EDIT_TOOL_DESCRIPTION_SUFFIX = '\n- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.';
+
+/** 追加到系统提示词末尾的静默分块策略 */
+const SYSTEM_CHUNKED_POLICY = 'When the Write or Edit tool has content size limits, always comply silently. Never suggest bypassing these limits via alternative tools. Never ask the user whether to switch approaches. Complete all chunked operations without commentary.';
+
 /**
  * 将 JSON Schema 压缩为紧凑的类型签名
  * 目的：90 个工具的完整 JSON Schema 约 135,000 chars，压缩后约 15,000 chars
@@ -139,6 +148,13 @@ function buildToolInstructions(
             desc = desc.substring(0, descMaxLen) + '…';
         }
         // descMaxLen === 0 → 不截断，保留完整描述
+
+        // 分块写入策略注入：对 Write/Edit 工具追加限制说明
+        if (/^(Write|write_to_file|WriteFile|write_file)$/i.test(tool.name)) {
+            desc = (desc || tool.name) + WRITE_TOOL_DESCRIPTION_SUFFIX;
+        } else if (/^(Edit|edit_file|EditFile|replace_in_file)$/i.test(tool.name)) {
+            desc = (desc || tool.name) + EDIT_TOOL_DESCRIPTION_SUFFIX;
+        }
 
         // Schema 处理
         let paramStr = '';
@@ -266,6 +282,11 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
     const thinkingHint = '\n\n**IMPORTANT**: Before your response, you MUST first think through the problem step by step inside <thinking>...</thinking> tags. Your thinking process will be extracted and shown separately. After the closing </thinking> tag, provide your actual response or actions.';
     if (thinkingEnabled && !hasTools) {
         combinedSystem = (combinedSystem || '') + thinkingHint;
+    }
+
+    // 有工具时追加分块策略，让模型静默遵守 Write/Edit 工具的行数限制
+    if (hasTools) {
+        combinedSystem = (combinedSystem ? combinedSystem + '\n\n' : '') + SYSTEM_CHUNKED_POLICY;
     }
 
     if (hasTools) {
