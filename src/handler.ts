@@ -19,6 +19,7 @@ import type {
 } from './types.js';
 import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converter.js';
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
+import { rotateProxy } from './proxy-agent.js';
 import { getConfig } from './config.js';
 import { createRequestLogger, type RequestLogger } from './logger.js';
 import { estimateTokens } from './tokenizer.js';
@@ -804,7 +805,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
 }
 
 // ==================== 重试辅助 ====================
-export const MAX_REFUSAL_RETRIES = 3;
+export const MAX_REFUSAL_RETRIES = 5;
 export const TOOL_CHOICE_MAX_RETRIES = 2;
 export const MIN_VALID_RESPONSE_CHARS = 3;
 
@@ -1216,6 +1217,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
             await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
                 if (event.type === 'finish') {
                     if (event.messageMetadata?.usage) cursorUsage = event.messageMetadata.usage;
+                    if (firstChunk) log.warn('Handler', 'retry', `Cursor 返回空响应，finish 事件: ${JSON.stringify(event)}`);
                     return;
                 }
                 if (event.type !== 'text-delta' || !event.delta) return;
@@ -1460,14 +1462,15 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
             }
         }
 
-        // 极短响应重试（仅在响应几乎为空时触发，避免误判正常短回答如 "2" 或 "25岁"）
-        const trimmed = fullResponse.trim();
-        if (hasTools && trimmed.length < MIN_VALID_RESPONSE_CHARS && !trimmed.match(/\d/) && retryCount < MAX_REFUSAL_RETRIES) {
+        // 极短响应重试（仅在响应几乎为空时触发，避免误判正常短回答如"2" 或 "25岁"）
+        let trimmed = fullResponse.trim();
+        while (hasTools && trimmed.length < MIN_VALID_RESPONSE_CHARS && !trimmed.match(/\d/) && retryCount < MAX_REFUSAL_RETRIES) {
             retryCount++;
             log.warn('Handler', 'retry', `响应过短 (${fullResponse.length} chars: "${trimmed}")，重试第${retryCount}次`);
             activeCursorReq = await convertToCursorRequest(body);
             await executeStream();
             log.info('Handler', 'retry', `重试响应: ${fullResponse.length} chars`, { preview: fullResponse.substring(0, 200) });
+            trimmed = fullResponse.trim();
         }
 
         // 流完成后，处理完整响应
@@ -1893,7 +1896,7 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
     }
 
     // ★ 极短响应重试（可能是连接中断）
-    if (hasTools && fullText.trim().length < MIN_VALID_RESPONSE_CHARS && retryCount < MAX_REFUSAL_RETRIES) {
+    while (hasTools && fullText.trim().length < MIN_VALID_RESPONSE_CHARS && retryCount < MAX_REFUSAL_RETRIES) {
         retryCount++;
         log.warn('Handler', 'retry', `非流式响应过短 (${fullText.length} chars)，重试第${retryCount}次`);
         activeCursorReq = await convertToCursorRequest(body);

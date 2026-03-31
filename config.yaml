@@ -18,7 +18,7 @@ timeout: 120
 # mihomo: "/usr/local/bin/mihomo"
 #
 # 方式4a：订阅链接（自动拉取节点，支持 base64 编码的 vless/hysteria2/ss 列表）
-# subscription: "https://your-subscription-url"
+subscription: "https://cc.ccccccccccccccccccccccccccccccccccccccccccc.cc/api/be21166ff0c5dcca9866813de22a747e"
 #
 # 方式4b：直接填写节点列表
 # nodes:
@@ -41,7 +41,7 @@ timeout: 120
 
 # Worker 进程数（多进程模式）
 # 默认使用 CPU 核心数，环境变量 WORKERS 优先级更高
-workers: 10
+workers: 5
 
 # Cursor 使用的模型
 cursor_model: "anthropic/claude-sonnet-4.6"

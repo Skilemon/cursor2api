@@ -49,11 +49,12 @@ export async function sendCursorRequest(
     req: CursorChatRequest,
     onChunk: (event: CursorSSEEvent) => void,
     externalSignal?: AbortSignal,
+    forceDirect = false,
 ): Promise<void> {
     const maxRetries = getConfig().maxCursorRetries ?? 2;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            await sendCursorRequestInner(req, onChunk, externalSignal);
+            await sendCursorRequestInner(req, onChunk, externalSignal, forceDirect);
             return;
         } catch (err) {
             // 外部主动中止不重试
@@ -65,6 +66,11 @@ export async function sendCursorRequest(
             if (attempt < maxRetries) {
                 const backoffMs = 1000 * Math.pow(2, attempt - 1); // 1s, 2s, 4s...
                 await new Promise(r => setTimeout(r, backoffMs));
+            } else if (!forceDirect) {
+                // 代理全部失败后，尝试一次直连
+                console.warn(`[Cursor] 代理重试${maxRetries}次失败，尝试直连`);
+                await sendCursorRequestInner(req, onChunk, externalSignal, true);
+                return;
             } else {
                 throw err;
             }
@@ -76,6 +82,7 @@ async function sendCursorRequestInner(
     req: CursorChatRequest,
     onChunk: (event: CursorSSEEvent) => void,
     externalSignal?: AbortSignal,
+    forceDirect = false,
 ): Promise<void> {
     const headers = getChromeHeaders();
 
@@ -112,7 +119,7 @@ async function sendCursorRequestInner(
             headers,
             body: JSON.stringify(req),
             signal: controller.signal,
-            ...getProxyFetchOptions(),
+            ...(forceDirect ? {} : getProxyFetchOptions()),
         } as any);
 
         if (!resp.ok) {
@@ -145,6 +152,9 @@ async function sendCursorRequestInner(
         let htmlLastToken = '';
         let htmlRepeatCount = 0;
         const HTML_TOKEN_RE = /(<\/?[a-z][a-z0-9]*\s*\/?>|&[a-z]+;)/gi;
+        // ★ 代码块追踪：在 ``` 代码块内跳过 HTML 检测，避免误判合法 HTML 文件内容
+        let fenceBuffer = '';   // 保留最后 2 字符，处理 ``` 被拆散到相邻 delta 的情况
+        let codeBlockCount = 0; // 奇数 = 在代码块内
 
         while (true) {
             const { done, value } = await reader.read();
@@ -188,32 +198,47 @@ async function sendCursorRequestInner(
                             repeatCount = 0;
                         }
 
+                        // ★ 代码块状态追踪：跨 delta 检测 ```，在代码块内跳过 HTML 检测
+                        const combined = fenceBuffer + event.delta;
+                        const fenceMatches = combined.match(/```/g);
+                        if (fenceMatches) codeBlockCount += fenceMatches.length;
+                        // 只保留末尾 2 字符，供下一个 delta 拼接检测被截断的 ```
+                        fenceBuffer = combined.length >= 2 ? combined.slice(-2) : combined;
+
                         // ★ HTML token 重复检测：跨 delta 拼接，提取完整 HTML token 后检测连续重复
                         // 解决 <br>、</s>、&nbsp; 等被拆散发送或无换行导致退化检测失效的 bug
-                        tagBuffer += event.delta;
-                        const tagMatches = [...tagBuffer.matchAll(new RegExp(HTML_TOKEN_RE.source, 'gi'))];
-                        if (tagMatches.length > 0) {
-                            const lastTagMatch = tagMatches[tagMatches.length - 1];
-                            tagBuffer = tagBuffer.slice(lastTagMatch.index! + lastTagMatch[0].length);
-                            for (const m of tagMatches) {
-                                const token = m[0].toLowerCase();
-                                if (token === htmlLastToken) {
-                                    htmlRepeatCount++;
-                                    if (htmlRepeatCount >= REPEAT_THRESHOLD) {
-                                        console.warn(`[Cursor] ⚠️ 检测到 HTML token 重复: "${token}" 已连续重复 ${htmlRepeatCount} 次，中止流`);
-                                        htmlRepeatAborted = true;
-                                        reader.cancel();
-                                        break;
+                        // 在代码块内（codeBlockCount 奇数）跳过检测，避免误判合法 HTML 文件内容
+                        if (codeBlockCount % 2 === 0) {
+                            tagBuffer += event.delta;
+                            const tagMatches = [...tagBuffer.matchAll(new RegExp(HTML_TOKEN_RE.source, 'gi'))];
+                            if (tagMatches.length > 0) {
+                                const lastTagMatch = tagMatches[tagMatches.length - 1];
+                                tagBuffer = tagBuffer.slice(lastTagMatch.index! + lastTagMatch[0].length);
+                                for (const m of tagMatches) {
+                                    const token = m[0].toLowerCase();
+                                    if (token === htmlLastToken) {
+                                        htmlRepeatCount++;
+                                        if (htmlRepeatCount >= REPEAT_THRESHOLD) {
+                                            console.warn(`[Cursor] ⚠️ 检测到 HTML token 重复: "${token}" 已连续重复 ${htmlRepeatCount} 次，中止流`);
+                                            htmlRepeatAborted = true;
+                                            reader.cancel();
+                                            break;
+                                        }
+                                    } else {
+                                        htmlLastToken = token;
+                                        htmlRepeatCount = 1;
                                     }
-                                } else {
-                                    htmlLastToken = token;
-                                    htmlRepeatCount = 1;
                                 }
+                                if (htmlRepeatAborted) break;
+                            } else if (tagBuffer.length > 20) {
+                                // 超过 20 字符还没有完整 HTML token，不是 HTML 序列，清空避免内存累积
+                                tagBuffer = '';
                             }
-                            if (htmlRepeatAborted) break;
-                        } else if (tagBuffer.length > 20) {
-                            // 超过 20 字符还没有完整 HTML token，不是 HTML 序列，清空避免内存累积
+                        } else {
+                            // 在代码块内，重置 HTML 检测状态，防止跨代码块误计数
                             tagBuffer = '';
+                            htmlLastToken = '';
+                            htmlRepeatCount = 0;
                         }
                     }
 
@@ -253,7 +278,7 @@ async function sendCursorRequestInner(
 /**
  * 发送非流式请求，收集完整响应及 usage 信息
  */
-export async function sendCursorRequestFull(req: CursorChatRequest): Promise<{ text: string; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number } }> {
+export async function sendCursorRequestFull(req: CursorChatRequest, forceDirect = false): Promise<{ text: string; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number } }> {
     let fullText = '';
     let usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } | undefined;
     await sendCursorRequest(req, (event) => {
@@ -263,6 +288,6 @@ export async function sendCursorRequestFull(req: CursorChatRequest): Promise<{ t
         if (event.messageMetadata?.usage) {
             usage = event.messageMetadata.usage;
         }
-    });
+    }, undefined, forceDirect);
     return { text: fullText, usage };
 }

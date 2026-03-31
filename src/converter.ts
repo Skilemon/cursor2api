@@ -40,6 +40,9 @@ const EDIT_TOOL_DESCRIPTION_SUFFIX = '\n- IMPORTANT: If the `new_string` content
 /** 追加到系统提示词末尾的静默分块策略 */
 const SYSTEM_CHUNKED_POLICY = 'When the Write or Edit tool has content size limits, always comply silently. Never suggest bypassing these limits via alternative tools. Never ask the user whether to switch approaches. Complete all chunked operations without commentary.';
 
+/** 追加到系统提示词末尾的任务细分策略：避免一次性输出过多内容导致超出 token 限制 */
+const TASK_DECOMPOSITION_POLICY = 'IMPORTANT: When given a complex task that requires multiple changes (across files, sections, or code blocks), you MUST: (1) Break the task into fine-grained subtasks. (2) Execute ONE subtask per response — do not modify multiple files or multiple large blocks in a single reply. (3) When editing files, use a single Edit call per response, then continue automatically to the next step in the following response. (4) Never output all changes at once — always work incrementally, one replacement at a time. Do NOT ask for confirmation between steps unless genuinely blocked. (5) Keep each response short: omit preamble, avoid restating the task, skip summaries of what you just did — go straight to the action. (6) If generating file content, NEVER output the full file inline as text — always use Write/Edit tool calls with chunked limits. This is mandatory to prevent exceeding the 32000 output token limit.';
+
 /**
  * 将 JSON Schema 压缩为紧凑的类型签名
  * 目的：90 个工具的完整 JSON Schema 约 135,000 chars，压缩后约 15,000 chars
@@ -287,6 +290,7 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
     // 有工具时追加分块策略，让模型静默遵守 Write/Edit 工具的行数限制
     if (hasTools) {
         combinedSystem = (combinedSystem ? combinedSystem + '\n\n' : '') + SYSTEM_CHUNKED_POLICY;
+        combinedSystem += '\n\n' + TASK_DECOMPOSITION_POLICY;
     }
 
     if (hasTools) {

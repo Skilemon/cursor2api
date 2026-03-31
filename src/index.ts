@@ -93,6 +93,21 @@ if (cluster.isPrimary) {
 } else {
     // ==================== Worker 进程 ====================
 
+    // ★ 给 Worker 的所有控制台输出加前缀，方便区分是哪个 Worker 打印的
+    const wIdx = process.env.WORKER_INDEX ?? process.pid;
+    const wPrefix = `[W${wIdx}] `;
+    for (const method of ['log', 'info', 'warn', 'error', 'debug'] as const) {
+        const orig = console[method].bind(console);
+        (console as any)[method] = (...args: unknown[]) => {
+            const first = args[0];
+            if (typeof first === 'string') {
+                orig(wPrefix + first, ...args.slice(1));
+            } else {
+                orig(wPrefix, ...args);
+            }
+        };
+    }
+
     // 初始化代理（每个 Worker 独立）
     const { initProxy } = await import('./proxy-agent.js');
     await initProxy();
